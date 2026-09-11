@@ -51,7 +51,6 @@ class craft_replica;
 // pass its ring or tolerate foreign-thread resumption; a blocking consumer (sisl::async::sync_get) is safe
 // either way. (The previous exec::task currency could hop an async consumer back to its own scheduler;
 // nothing in this stack used that, and the on-ring data path is built on NOT doing it.)
-
 // ── construction: the ONE seam ──
 //
 // Build a client over a transport: one backend per member, in membership order (`leader` is where login is tried

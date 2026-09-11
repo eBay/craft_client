@@ -48,7 +48,6 @@ public:
                                                                     nuraft_mesg::group_id_t const& group_id) override;
 
 private:
-    raft_service() = default;
     consensus_handle consensus_;
     nuraft_mesg::peer_id_t server_uuid_;
     std::once_flag raft_started_;

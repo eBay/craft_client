@@ -1,5 +1,6 @@
 #pragma once
 #include <boost/uuid/random_generator.hpp>
+#include <boost/uuid/uuid_io.hpp>
 #include <nlohmann/json.hpp>
 #include <stdexec/execution.hpp>
 #include <fstream>

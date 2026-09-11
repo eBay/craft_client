@@ -46,7 +46,7 @@ craft_tcp_server::craft_tcp_server(server_geometry geo, std::string const& serve
         raft_enabled_{init_raft_service} {
     auto ep = replica_endpoint{.id = to_uuid(geo_.member.id), .addr = geo_.member.addr};
     LOGINFO("craft_tcp_server: starting [id={}] config_file='{}'", boost::uuids::to_string(ep.id), server_config_file);
-    replica_ = std::make_shared< RaftReplica >(std::move(ep), geo_.lba_size, geo_.max_tx, server_config_file,
+    replica_ = std::make_shared< RaftReplica >(std::move(ep), geo_.lba_size, geo_.max_tx, server_config_file, nullptr,
                                                registry_mgr_, init_raft_service);
 }
 
