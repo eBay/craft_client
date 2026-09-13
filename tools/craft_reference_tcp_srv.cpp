@@ -81,7 +81,7 @@ int main(int argc, char** argv) {
     }
     sisl::logging::SetLogger(fmt::format("craft_tcp_srv_{}", SISL_OPTIONS["server_uuid"].as< std::string >()));
     std::string const s = SISL_OPTIONS.count("log_mods") ? SISL_OPTIONS["log_mods"].as< std::string >() : "";
-    for (auto const* mod : {"nuraft_mesg", "grpc_server"}) {
+    for (auto const* mod : {"nuraft_mesg", "grpc_server", "craft", "base"}) {
         if (!s.contains(mod)) { sisl::logging::SetModuleLogLevel(mod, spdlog::level::info); }
     }
 

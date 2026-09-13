@@ -160,15 +160,12 @@ void RaftReplica::replica_init(std::string const& replica_config_path) {
         });
         reg->put< raft_peer_t >(raft_service::peer_id_key(id),
                                 std::make_shared< raft_peer_t >(std::make_pair(r->host, r->raft_port)));
-        reg->put< replica_info >(registry_key(replica_info_key_prefix, r->id), std::move(r));
+        reg->put< replica_info >(registry_key(replica_info_key_prefix, id), std::move(r));
     }
 }
 
 void RaftReplica::raft_init() {
-    if (!raft_service_) {
-        LOGINFO("RAFT already initialized for replica {}", boost::uuids::to_string(ep_.id));
-        return;
-    }
+    raft_service_ = raft_service::create(ep_.id, registry_mgr_);
     auto commit_cb = [this](uint64_t log_idx, nlohmann::json const& j, std::string const& partition_uuid_str) {
         auto const partition_uuid = boost::uuids::string_generator()(partition_uuid_str);
         auto const op_val = j.at("op").get< int >();
@@ -239,10 +236,9 @@ RaftReplica::RaftReplica(replica_endpoint ep, uint32_t page_size, uint32_t max_t
         MemCraftReplica{std::move(ep), page_size, nullptr},
         max_tx_{max_tx},
         commit_worker_{std::make_unique< RaftReplica::RaftCommitWorker >()},
-        registry_mgr_{std::move(registry_mgr)},
-        raft_service_{init_raft_service ? std::make_shared< raft_service >(ep_.id, registry_mgr_) : nullptr} {
+        registry_mgr_{std::move(registry_mgr)} {
     replica_init(replica_config_path);
-    raft_init();
+    if (init_raft_service) { raft_init(); }
     journal_init();
 
     // set the watchdog

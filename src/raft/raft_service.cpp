@@ -29,12 +29,14 @@ static nuraft::ptr< nuraft::buffer > create_message(nlohmann::json const& j_obj)
 
 raft_service::raft_service(boost::uuids::uuid const& server_uuid, std::weak_ptr< registry_manager > registry_mgr) :
         server_uuid_(server_uuid),
-        registry_mgr_(std::move(registry_mgr)) {
+        registry_mgr_(std::move(registry_mgr)) {}
+
+void raft_service::init() {
     nuraft::nuraft_global_mgr::init(); // raft global manager for commits
     std::call_once(raft_started_, [&] {
         auto my_info = lock_registry(registry_mgr_)->get< raft_peer_t >(peer_id_key(server_uuid_));
         if (!my_info) {
-            LOGERROR("Could not start raft service, unrecognized replica uuid {}", server_uuid);
+            LOGERROR("Could not start raft service, unrecognized replica uuid {}", server_uuid_);
             return;
         }
         auto params = nuraft_mesg::manager::params{
@@ -52,6 +54,13 @@ raft_service::raft_service(boost::uuids::uuid const& server_uuid, std::weak_ptr<
         LOGINFO("Initialized raft_service for {} with raft consensus manager, port {}", params.server_uuid_,
                 params.mesg_port_);
     });
+}
+
+std::shared_ptr< raft_service > raft_service::create(boost::uuids::uuid const& server_uuid,
+                                                     std::weak_ptr< registry_manager > registry_mgr) {
+    auto service = std::shared_ptr< raft_service >(new raft_service(server_uuid, std::move(registry_mgr)));
+    service->init();
+    return service;
 }
 
 raft_service::~raft_service() {

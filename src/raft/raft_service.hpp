@@ -30,7 +30,11 @@ public:
     inline static const std::string peer_id_key(boost::uuids::uuid const& peer_id) {
         return fmt::format("raft_peer_{}", boost::uuids::to_string(peer_id));
     }
-    raft_service(boost::uuids::uuid const& server_uuid, std::weak_ptr< registry_manager > registry_mgr);
+
+    // the constructor uses weak_from_this which requires the shared_ptr obj to be created.
+    static std::shared_ptr< raft_service > create(boost::uuids::uuid const& server_uuid,
+                                                  std::weak_ptr< registry_manager > registry_mgr);
+
     virtual ~raft_service();
     result< void > srv_create_partition(boost::uuids::uuid const& group_id,
                                         std::vector< replica_endpoint > const& members);
@@ -48,6 +52,9 @@ public:
                                                                     nuraft_mesg::group_id_t const& group_id) override;
 
 private:
+    raft_service(boost::uuids::uuid const& server_uuid, std::weak_ptr< registry_manager > registry_mgr);
+    void init();
+
     consensus_handle consensus_;
     nuraft_mesg::peer_id_t server_uuid_;
     std::once_flag raft_started_;
