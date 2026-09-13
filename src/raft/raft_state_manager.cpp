@@ -14,7 +14,8 @@ std::string const log_store_key_prefix{"raft_log_store"};
 
 namespace craft {
 
-std::error_condition loadConfigFile(json& config_map, std::string const& _group_id, int32_t const _srv_id, std::shared_ptr< registry_manager >& _registry_mgr) {
+std::error_condition loadConfigFile(json& config_map, std::string const& _group_id, int32_t const _srv_id,
+                                    std::shared_ptr< registry_manager >& _registry_mgr) {
     auto const registry_key = fmt::format(FMT_STRING("{}_s{}_config"), _group_id, _srv_id);
     auto json_ptr = _registry_mgr->get< json >(registry_key);
     if (!json_ptr) {
@@ -25,7 +26,8 @@ std::error_condition loadConfigFile(json& config_map, std::string const& _group_
     return {};
 }
 
-std::error_condition loadStateFile(json& state_map, std::string const& _group_id, int32_t const _srv_id, std::shared_ptr< registry_manager >& _registry_mgr) {
+std::error_condition loadStateFile(json& state_map, std::string const& _group_id, int32_t const _srv_id,
+                                   std::shared_ptr< registry_manager >& _registry_mgr) {
     auto const registry_key = fmt::format(FMT_STRING("{}_s{}_state"), _group_id, _srv_id);
     auto json_ptr = _registry_mgr->get< json >(registry_key);
     if (!json_ptr) {
@@ -105,8 +107,8 @@ nuraft::ptr< nuraft::log_store > raft_state_mgr::load_log_store() {
     }
     LOGDEBUG("Creating RAFT log store for group_id={}", _group_id);
     log_store = std::make_shared< nuraft::inmem_log_store >();
-    reg->put< nuraft::inmem_log_store >(
-        registry_key(log_store_key_prefix, boost::uuids::string_generator()(_group_id)), log_store);
+    reg->put< nuraft::inmem_log_store >(registry_key(log_store_key_prefix, boost::uuids::string_generator()(_group_id)),
+                                        log_store);
     return log_store;
 }
 
@@ -131,16 +133,18 @@ void raft_state_mgr::save_config(const nuraft::cluster_config& config) {
                          {"eventual_consistency", config.is_async_replication()},
                          {"user_ctx", config.get_user_ctx()},
                          {"servers", toServers(const_cast< nuraft::cluster_config& >(config).get_servers())}};
-    lock_registry(_registry_mgr)->put< json >(fmt::format(FMT_STRING("{}_s{}_config"), _group_id, _srv_id),
-                                              std::make_shared< json >(std::move(json_obj)));
+    lock_registry(_registry_mgr)
+        ->put< json >(fmt::format(FMT_STRING("{}_s{}_config"), _group_id, _srv_id),
+                      std::make_shared< json >(std::move(json_obj)));
 }
 
 void raft_state_mgr::save_state(const nuraft::srv_state& state) {
     auto const state_file = fmt::format(FMT_STRING("{}_s{}/state.json"), _group_id, _srv_id);
     auto json_obj = json{{"term", state.get_term()}, {"voted_for", state.get_voted_for()}};
 
-    lock_registry(_registry_mgr)->put< json >(fmt::format(FMT_STRING("{}_s{}_state"), _group_id, _srv_id),
-                                              std::make_shared< json >(std::move(json_obj)));
+    lock_registry(_registry_mgr)
+        ->put< json >(fmt::format(FMT_STRING("{}_s{}_state"), _group_id, _srv_id),
+                      std::make_shared< json >(std::move(json_obj)));
 }
 
 uint32_t raft_state_mgr::get_logstore_id() const { return 0; }

@@ -41,13 +41,18 @@ std::span< uint8_t const > as_bytes(T const& v) {
 
 craft_tcp_server::craft_tcp_server(server_geometry geo, std::string const& server_config_file,
                                    std::shared_ptr< registry_manager > registry_mgr, bool init_raft_service) :
-        geo_{std::move(geo)},
-        registry_mgr_{std::move(registry_mgr)},
-        raft_enabled_{init_raft_service} {
+        geo_{std::move(geo)}, registry_mgr_{std::move(registry_mgr)}, raft_enabled_{init_raft_service} {
     auto ep = replica_endpoint{.id = to_uuid(geo_.member.id), .addr = geo_.member.addr};
     LOGINFO("craft_tcp_server: starting [id={}] config_file='{}'", boost::uuids::to_string(ep.id), server_config_file);
-    replica_ = std::make_shared< RaftReplica >(std::move(ep), geo_.lba_size, geo_.max_tx, server_config_file, nullptr,
-                                               registry_mgr_, init_raft_service);
+    replica_ = std::make_shared< RaftReplica >(raft_replica_params{
+        .ep = std::move(ep),
+        .page_size = geo_.lba_size,
+        .max_tx = geo_.max_tx,
+        .replica_config_path = server_config_file,
+        .watchdog = std::make_shared< Watchdog >(),
+        .registry_mgr = registry_mgr_,
+        .init_raft_service = init_raft_service,
+    });
 }
 
 craft_tcp_server::~craft_tcp_server() = default;

@@ -10,25 +10,24 @@ namespace craft {
 
 class registry_manager {
 public:
-    template <typename T>
-    void put(std::string const& key, std::shared_ptr<T> value) {
+    template < typename T >
+    void put(std::string const& key, std::shared_ptr< T > value) {
         std::lock_guard lock(component_mutex_);
         component_store_[key] = std::move(value);
     }
 
-    template <typename T>
-    std::shared_ptr<T> get(std::string const& key) const {
+    template < typename T >
+    std::shared_ptr< T > get(std::string const& key) const {
         std::lock_guard lock(component_mutex_);
         auto it = component_store_.find(key);
         if (it == component_store_.end()) return nullptr;
-        auto* ptr = std::any_cast<std::shared_ptr<T>>(&it->second);
+        auto* ptr = std::any_cast< std::shared_ptr< T > >(&it->second);
         return ptr ? *ptr : nullptr;
     }
 
-
 private:
     mutable std::mutex component_mutex_;
-    std::unordered_map<std::string, std::any> component_store_;
+    std::unordered_map< std::string, std::any > component_store_;
 };
 
 inline std::shared_ptr< registry_manager > lock_registry(std::weak_ptr< registry_manager > const& w) {
@@ -37,4 +36,4 @@ inline std::shared_ptr< registry_manager > lock_registry(std::weak_ptr< registry
     return r;
 }
 
-}
+} // namespace craft

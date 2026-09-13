@@ -41,11 +41,19 @@ class raft_service;
 struct SyncRSCommitLSNMsg;
 struct InternalLoginMsg;
 
+struct raft_replica_params {
+    replica_endpoint ep;
+    uint32_t page_size;
+    uint32_t max_tx;
+    std::string replica_config_path;
+    std::shared_ptr< Watchdog > watchdog;
+    std::weak_ptr< registry_manager > registry_mgr;
+    bool init_raft_service{false};
+};
+
 class RaftReplica final : public MemCraftReplica {
 public:
-    RaftReplica(replica_endpoint ep, uint32_t page_size, uint32_t max_tx, std::string const& replica_config_path,
-                std::shared_ptr< Watchdog > watchdog = nullptr, std::weak_ptr< registry_manager > registry_mgr = {},
-                bool init_raft_service = false);
+    RaftReplica(raft_replica_params params);
 
     ~RaftReplica();
 
@@ -84,7 +92,7 @@ private:
     std::mutex login_mu_;
     std::condition_variable login_cv_;
     bool login_done_{false};
-    
+
     class RaftCommitWorker;
     std::unique_ptr< RaftCommitWorker > commit_worker_;
     std::optional< Watchdog::TimerId > pending_login_timer_;

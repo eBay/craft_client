@@ -63,7 +63,8 @@ struct replica_info {
     std::shared_ptr< net::CraftTcpPeer > peer_client{nullptr};
 };
 
-std::vector< replica_info > peer_list(boost::uuids::uuid const& partition_id, std::shared_ptr< registry_manager > registry_mgr) {
+std::vector< replica_info > peer_list(boost::uuids::uuid const& partition_id,
+                                      std::shared_ptr< registry_manager > registry_mgr) {
     partition_peers_list_t peers;
     if (auto peers_ptr =
             registry_mgr->get< partition_peers_list_t >(registry_key(partition_info_key_prefix, partition_id));
@@ -204,8 +205,7 @@ void RaftReplica::raft_init() {
     };
 
     raft_service_->add_commit_cb(std::move(commit_cb));
-    LOGDEBUG("RaftReplica constructed [id={}] lba_size={}", boost::uuids::to_string(ep_.id),
-             page_size_);
+    LOGDEBUG("RaftReplica constructed [id={}] lba_size={}", boost::uuids::to_string(ep_.id), page_size_);
 }
 
 void RaftReplica::journal_init() {
@@ -230,23 +230,21 @@ void RaftReplica::journal_init() {
     }
 }
 
-RaftReplica::RaftReplica(replica_endpoint ep, uint32_t page_size, uint32_t max_tx,
-                         std::string const& replica_config_path, std::shared_ptr< Watchdog > watchdog,
-                         std::weak_ptr< registry_manager > registry_mgr, bool init_raft_service) :
-        MemCraftReplica{std::move(ep), page_size, nullptr},
-        max_tx_{max_tx},
+RaftReplica::RaftReplica(raft_replica_params params) :
+        MemCraftReplica{std::move(params.ep), params.page_size, nullptr},
+        max_tx_{params.max_tx},
         commit_worker_{std::make_unique< RaftReplica::RaftCommitWorker >()},
-        registry_mgr_{std::move(registry_mgr)} {
-    replica_init(replica_config_path);
-    if (init_raft_service) { raft_init(); }
+        registry_mgr_{std::move(params.registry_mgr)} {
+    replica_init(params.replica_config_path);
+    if (params.init_raft_service) { raft_init(); }
     journal_init();
 
     // set the watchdog
-    if (!watchdog) {
+    if (!params.watchdog) {
         LOGWARN("watchdog is not provided, using default watchdog");
         watchdog_ = std::make_shared< Watchdog >();
     } else {
-        watchdog_ = std::move(watchdog);
+        watchdog_ = std::move(params.watchdog);
     }
 }
 
@@ -445,7 +443,9 @@ result< LoginResult > RaftReplica::apply_login(std::array< uint8_t, 16 > const& 
              boost::uuids::to_string(partition_uuid), members.size());
     for (auto const& m : members) {
         if (m.id == ep_.id) { continue; }
-        if (auto r = sisl::async::sync_get(m.peer_client->get_rs_commit_lsn(term /* send proposed term */, true /* is_login */)); r) {
+        if (auto r = sisl::async::sync_get(
+                m.peer_client->get_rs_commit_lsn(term /* send proposed term */, true /* is_login */));
+            r) {
             LOGDEBUG("apply_login[partition={}]: peer {} reported commit_lsn={} last_append_lsn={}",
                      boost::uuids::to_string(partition_uuid), boost::uuids::to_string(m.id), r->commit_lsn,
                      r->last_append_lsn);
@@ -508,8 +508,7 @@ result< LoginResult > RaftReplica::apply_login(std::array< uint8_t, 16 > const& 
     }
     LOGINFO("apply_login[partition={}]: LOGIN SUCCESS term={} dLSN={} members={}",
             boost::uuids::to_string(partition_uuid), term, rs_commit_lsn, replicas.size());
-    return LoginResult{.members = replicas,
-                       .dLSN = rs_commit_lsn};
+    return LoginResult{.members = replicas, .dLSN = rs_commit_lsn};
 }
 
 // create peer raft group and add members to it.

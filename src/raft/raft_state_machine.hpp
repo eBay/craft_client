@@ -62,10 +62,7 @@ class echo_state_machine : public nuraft::state_machine {
 public:
     echo_state_machine(raft_commit_cb_t const& cb, std::string const& group_id,
                        std::weak_ptr< registry_manager > registry_mgr) :
-            commit_cb_{cb},
-            group_id_{group_id},
-            last_commit_idx_(0),
-            registry_mgr_(std::move(registry_mgr)) {}
+            commit_cb_{cb}, group_id_{group_id}, last_commit_idx_(0), registry_mgr_(std::move(registry_mgr)) {}
 
     virtual nuraft::ptr< nuraft::buffer > commit(nuraft::ulong log_idx, nuraft::buffer& data) override {
         nlohmann::json j;
