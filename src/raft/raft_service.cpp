@@ -157,9 +157,7 @@ nuraft_mesg::peer_id_t raft_service::leader_id(nuraft_mesg::group_id_t const& gr
         LOGWARN("No leader for the raft group {}", group_id);
         return {};
     }
-    if (auto const lid = raft_ctx->raft_leader_id(); !lid.empty()) {
-        return boost::uuids::string_generator()(lid);
-    }
+    if (auto const lid = raft_ctx->raft_leader_id(); !lid.empty()) { return boost::uuids::string_generator()(lid); }
     LOGWARN("No leader for the raft group {}", group_id);
     return {};
 }
@@ -194,7 +192,7 @@ result< void > raft_service::srv_recover_partition(boost::uuids::uuid const& gro
         return fail(craft_error::INTERNAL);
     }
     auto mgr = std::make_shared< raft_state_mgr >(nuraft_mesg::to_server_id(server_uuid_), server_uuid_, group_id,
-                                                   commit_cb_, registry_mgr_);
+                                                  commit_cb_, registry_mgr_);
     if (auto const r = consensus_->join_group(group_id, default_group_type_, mgr); !r) {
         LOGERROR("srv_recover_partition[{}]: join_group failed", boost::uuids::to_string(group_id));
         return fail(craft_error::INTERNAL);
