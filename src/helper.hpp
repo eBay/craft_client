@@ -1,5 +1,6 @@
 #pragma once
 #include <boost/uuid/random_generator.hpp>
+#include <boost/uuid/uuid_io.hpp>
 #include <nlohmann/json.hpp>
 #include <stdexec/execution.hpp>
 #include <fstream>
@@ -45,6 +46,10 @@ inline std::error_condition jsonObjectFromFile(std::string const& filename, json
         return std::make_error_condition(std::errc::invalid_argument);
     }
     return std::error_condition();
+}
+
+inline std::string registry_key(std::string const& prefix, boost::uuids::uuid const& id) {
+    return fmt::format("{}_{}", prefix, boost::uuids::to_string(id));
 }
 
 } // namespace craft

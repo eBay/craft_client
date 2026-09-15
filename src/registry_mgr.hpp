@@ -1,0 +1,50 @@
+#pragma once
+
+#include <memory>
+#include <mutex>
+#include <unordered_map>
+#include <any>
+#include <sisl/logging/logging.h>
+
+namespace craft {
+
+class registry_manager {
+public:
+    template < typename T >
+    void put(std::string const& key, std::shared_ptr< T > value) {
+        std::lock_guard lock(component_mutex_);
+        component_store_[key] = std::move(value);
+    }
+
+    template < typename T >
+    std::shared_ptr< T > get(std::string const& key) const {
+        std::lock_guard lock(component_mutex_);
+        auto it = component_store_.find(key);
+        if (it == component_store_.end()) return nullptr;
+        auto* ptr = std::any_cast< std::shared_ptr< T > >(&it->second);
+        return ptr ? *ptr : nullptr;
+    }
+
+    template < typename T >
+    std::vector< std::pair< std::string, std::shared_ptr< T > > > get_prefix(std::string const& prefix) const {
+        std::lock_guard lock(component_mutex_);
+        std::vector< std::pair< std::string, std::shared_ptr< T > > > result;
+        for (auto const& [key, val] : component_store_) {
+            if (!key.starts_with(prefix)) continue;
+            if (auto const* ptr = std::any_cast< std::shared_ptr< T > >(&val)) result.emplace_back(key, *ptr);
+        }
+        return result;
+    }
+
+private:
+    mutable std::mutex component_mutex_;
+    std::unordered_map< std::string, std::any > component_store_;
+};
+
+inline std::shared_ptr< registry_manager > lock_registry(std::weak_ptr< registry_manager > const& w) {
+    auto r = w.lock();
+    RELEASE_ASSERT(r, "registry destroyed before component");
+    return r;
+}
+
+} // namespace craft
