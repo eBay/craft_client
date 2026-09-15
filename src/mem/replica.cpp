@@ -254,6 +254,7 @@ result< lsn_pair > MemCraftReplica::do_write(client_hdr hdr, int64_t dlsn, uint6
     (*journal_)[dlsn] = std::move(slot);
     state_.last_append_lsn = std::max(state_.last_append_lsn, dlsn);
     apply_up_to(hdr.commit_lsn); // piggybacked commit: advance the frontier best-effort, in dLSN order
+    on_state_changed();
     // Piggyback the watermarks on the ack (the wire's write_rsp), so any round-trip refreshes the client.
     return lsn_pair{state_.commit_lsn, state_.last_append_lsn};
 }
@@ -292,6 +293,7 @@ status MemCraftReplica::do_truncate(int64_t lsn) {
     std::lock_guard< std::mutex > g{mu_};
     journal_->erase(journal_->upper_bound(lsn), journal_->end());
     state_.last_append_lsn = std::min(state_.last_append_lsn, lsn);
+    on_state_changed();
     return ok();
 }
 
@@ -339,6 +341,7 @@ result< resolution_result > MemCraftReplica::do_resolve_local(client_hdr hdr, in
     }
     state_.last_append_lsn = std::max(state_.last_append_lsn, upto);
     apply_up_to(upto);
+    on_state_changed();
     return out;
 }
 
@@ -512,16 +515,19 @@ void MemCraftReplica::cold_apply_login(uint64_t client_token, uint64_t term) {
     std::lock_guard< std::mutex > g{mu_};
     state_.client_token = client_token;
     state_.term = term;
+    on_state_changed();
 }
 void MemCraftReplica::cold_apply_logout() {
     std::lock_guard< std::mutex > g{mu_};
     state_.client_token = 0;
     state_.term = 0; // no active session; subsequent IOs with old term fail STALE_TERM
+    on_state_changed();
 }
 void MemCraftReplica::cold_truncate_above(int64_t rs_commit_lsn) {
     std::lock_guard< std::mutex > g{mu_};
     journal_->erase(journal_->upper_bound(rs_commit_lsn), journal_->end());
     state_.last_append_lsn = std::min(state_.last_append_lsn, rs_commit_lsn);
+    on_state_changed();
 }
 
 // ── resolution-round hooks (driven by MemTransport::run_resolution) ──

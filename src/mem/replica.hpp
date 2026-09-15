@@ -275,6 +275,7 @@ private:
     std::vector< int64_t > peek_empties(int64_t upto); // every is_empty dLSN <= upto
 
 protected:
+    virtual void on_state_changed() {} // called under mu_ after every state_ mutation; override to persist
     void cold_apply_login(uint64_t client_token, uint64_t term);
     void cold_truncate_above(int64_t rs_commit_lsn);
     void cold_install_slot(int64_t dlsn, MemJournalSlot s); // fill a hole; never overwrites an entry

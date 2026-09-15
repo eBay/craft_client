@@ -53,6 +53,7 @@ std::string const replica_info_key_prefix{"replica_info"};
 std::string const partition_info_key_prefix{"partition_info"};
 std::string const journal_key_prefix{"journal"};
 std::string const index_key_prefix{"index"};
+std::string const state_key_prefix{"craft_state"};
 using partition_peers_list_t = std::vector< boost::uuids::uuid >;
 
 struct replica_info {
@@ -230,6 +231,30 @@ void RaftReplica::journal_init() {
     }
 }
 
+void RaftReplica::state_init() {
+    auto reg = registry_mgr_.lock();
+    if (!reg) {
+        LOGWARN("state_init[{}]: registry not available", boost::uuids::to_string(ep_.id));
+        return;
+    }
+    if (auto existing = reg->get< CraftPartitionState >(registry_key(state_key_prefix, ep_.id)); existing) {
+        state_ = *existing;
+        LOGINFO("state_init[{}]: recovered state term={} commit_lsn={} last_append_lsn={}",
+                boost::uuids::to_string(ep_.id), state_.term, state_.commit_lsn, state_.last_append_lsn);
+    } else {
+        reg->put< CraftPartitionState >(registry_key(state_key_prefix, ep_.id),
+                                        std::make_shared< CraftPartitionState >(state_));
+        LOGINFO("state_init[{}]: initialized fresh state", boost::uuids::to_string(ep_.id));
+    }
+}
+
+void RaftReplica::persist_state() {
+    auto reg = registry_mgr_.lock();
+    if (!reg) { return; }
+    reg->put< CraftPartitionState >(registry_key(state_key_prefix, ep_.id),
+                                    std::make_shared< CraftPartitionState >(state_));
+}
+
 RaftReplica::RaftReplica(raft_replica_params params) :
         MemCraftReplica{std::move(params.ep), params.page_size, nullptr},
         max_tx_{params.max_tx},
@@ -238,6 +263,7 @@ RaftReplica::RaftReplica(raft_replica_params params) :
     replica_init(params.replica_config_path);
     if (params.init_raft_service) { raft_init(); }
     journal_init();
+    state_init();
 
     // set the watchdog
     if (!params.watchdog) {
@@ -414,6 +440,7 @@ result< LoginResult > RaftReplica::apply_login(std::array< uint8_t, 16 > const& 
         std::lock_guard< std::mutex > g{mu_};
         state_.term = term;
         state_.client_token = client_token;
+        on_state_changed();
         LOGINFO("apply_login [id={}]: raft disabled, cold-path login OK, term={} token={}",
                 boost::uuids::to_string(ep_.id), term, client_token);
         return LoginResult{.members = {ep_}, .dLSN = state_.last_append_lsn};
@@ -590,6 +617,7 @@ void RaftReplica::apply_sync(boost::uuids::uuid const& partition_uuid, SyncRSCom
     std::lock_guard< std::mutex > g{mu_};
     apply_up_to(m.rs_commit_lsn);
     state_.commit_lsn = m.rs_commit_lsn;
+    on_state_changed();
     LOGDEBUG("apply_sync[partition={}]: done, commit_lsn now {} (target rs_commit_lsn={})",
              boost::uuids::to_string(partition_uuid), state_.commit_lsn, m.rs_commit_lsn);
 }
@@ -604,6 +632,7 @@ void RaftReplica::internal_login(InternalLoginMsg m) {
         std::lock_guard< std::mutex > g{mu_};
         state_.client_token = m.client_token;
         state_.term = m.term;
+        on_state_changed();
         if (pending_login_timer_) {
             watchdog_->cancel(*pending_login_timer_);
             pending_login_timer_.reset();

@@ -86,6 +86,9 @@ private:
     void raft_init();
     void replica_init(std::string const& replica_config_path);
     void journal_init();
+    void state_init();
+    void persist_state(); // called under mu_
+    void on_state_changed() override { persist_state(); }
 
     uint32_t max_tx_;
     std::atomic< int64_t > rs_commit_lsn_{-1};
