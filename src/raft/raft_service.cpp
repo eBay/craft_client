@@ -9,9 +9,7 @@
 #include <boost/uuid/string_generator.hpp>
 #include <utility>
 
-namespace {
-std::string const state_mgr_key_prefix{"raft_state_mgr"};
-}
+namespace {}
 
 namespace craft {
 
@@ -109,17 +107,11 @@ std::string raft_service::lookup_peer(nuraft_mesg::peer_id_t const& peer_id) {
 
 std::shared_ptr< nuraft_mesg::mesg_state_mgr > raft_service::create_state_mgr(int32_t const srv_id,
                                                                               nuraft_mesg::group_id_t const& group_id) {
-    auto reg = lock_registry(registry_mgr_);
-    auto result = reg->get< raft_state_mgr >(registry_key(state_mgr_key_prefix, group_id));
-    if (result) {
-        LOGINFO("RAFT state manager for group_id={} already exists, returning existing instance",
-                boost::uuids::to_string(group_id));
-        return result;
-    }
+    // Always create fresh — never cache the state manager. The commit_cb_ captures a live `this`; a cached
+    // instance from a prior run holds a stale pointer. Log store, cluster config, and srv_state survive in
+    // their own registry keys and are loaded by the fresh instance's methods.
     LOGINFO("Creating RAFT state manager for server_id={} group_id={}", srv_id, boost::uuids::to_string(group_id));
-    auto mgr = std::make_shared< raft_state_mgr >(srv_id, server_uuid_, group_id, commit_cb_, registry_mgr_);
-    reg->put< raft_state_mgr >(registry_key(state_mgr_key_prefix, group_id), mgr);
-    return mgr;
+    return std::make_shared< raft_state_mgr >(srv_id, server_uuid_, group_id, commit_cb_, registry_mgr_);
 }
 
 void raft_service::add_commit_cb(raft_commit_cb_t cb) {
@@ -131,18 +123,22 @@ void raft_service::add_commit_cb(raft_commit_cb_t cb) {
     commit_cb_ = std::move(cb);
 }
 
+static raft_state_mgr* lookup_mgr(consensus_handle const& consensus, nuraft_mesg::group_id_t const& group_id) {
+    auto base = consensus->lookup_state_manager(group_id);
+    return base ? static_cast< raft_state_mgr* >(base.get()) : nullptr;
+}
+
 bool raft_service::is_leader(nuraft_mesg::group_id_t const& group_id) {
     if (!consensus_) {
         LOGERROR("Raft not enabled!");
         return false;
     }
-    auto const state_mgr =
-        lock_registry(registry_mgr_)->get< raft_state_mgr >(registry_key(state_mgr_key_prefix, group_id));
-    if (!state_mgr) {
+    auto* mgr = lookup_mgr(consensus_, group_id);
+    if (!mgr) {
         LOGWARN("RAFT state manager for group_id={} not found", boost::uuids::to_string(group_id));
         return false;
     }
-    auto* raft_ctx = state_mgr->repl_ctx();
+    auto* raft_ctx = mgr->repl_ctx();
     return raft_ctx && raft_ctx->is_raft_leader();
 }
 
@@ -151,19 +147,18 @@ nuraft_mesg::peer_id_t raft_service::leader_id(nuraft_mesg::group_id_t const& gr
         LOGERROR("Raft not enabled!");
         return {};
     }
-    auto const state_mgr =
-        lock_registry(registry_mgr_)->get< raft_state_mgr >(registry_key(state_mgr_key_prefix, group_id));
-    if (!state_mgr) {
+    auto* mgr = lookup_mgr(consensus_, group_id);
+    if (!mgr) {
         LOGWARN("RAFT state manager for group_id={} not found", boost::uuids::to_string(group_id));
         return {};
     }
-    auto* raft_ctx = state_mgr->repl_ctx();
+    auto* raft_ctx = mgr->repl_ctx();
     if (!raft_ctx) {
         LOGWARN("No leader for the raft group {}", group_id);
         return {};
     }
-    if (auto const leader_id = raft_ctx->raft_leader_id(); !leader_id.empty()) {
-        return boost::uuids::string_generator()(raft_ctx->raft_leader_id());
+    if (auto const lid = raft_ctx->raft_leader_id(); !lid.empty()) {
+        return boost::uuids::string_generator()(lid);
     }
     LOGWARN("No leader for the raft group {}", group_id);
     return {};
@@ -171,8 +166,7 @@ nuraft_mesg::peer_id_t raft_service::leader_id(nuraft_mesg::group_id_t const& gr
 
 template < typename MsgT >
 result< void > raft_service::propose(boost::uuids::uuid const& group_id, MsgT const& payload) {
-    auto const state_mgr =
-        lock_registry(registry_mgr_)->get< raft_state_mgr >(registry_key(state_mgr_key_prefix, group_id));
+    auto* state_mgr = lookup_mgr(consensus_, group_id);
     if (!state_mgr) {
         LOGWARN("RAFT state manager for group_id={} not found", boost::uuids::to_string(group_id));
         return std::unexpected(make_error_condition(craft_error::INTERNAL));
@@ -193,5 +187,20 @@ result< void > raft_service::propose(boost::uuids::uuid const& group_id, MsgT co
 template result< void > raft_service::propose< SyncRSCommitLSNMsg >(boost::uuids::uuid const&,
                                                                     SyncRSCommitLSNMsg const&);
 template result< void > raft_service::propose< InternalLoginMsg >(boost::uuids::uuid const&, InternalLoginMsg const&);
+
+result< void > raft_service::srv_recover_partition(boost::uuids::uuid const& group_id) {
+    if (!consensus_) {
+        LOGERROR("srv_recover_partition[{}]: raft not enabled", boost::uuids::to_string(group_id));
+        return fail(craft_error::INTERNAL);
+    }
+    auto mgr = std::make_shared< raft_state_mgr >(nuraft_mesg::to_server_id(server_uuid_), server_uuid_, group_id,
+                                                   commit_cb_, registry_mgr_);
+    if (auto const r = consensus_->join_group(group_id, default_group_type_, mgr); !r) {
+        LOGERROR("srv_recover_partition[{}]: join_group failed", boost::uuids::to_string(group_id));
+        return fail(craft_error::INTERNAL);
+    }
+    LOGINFO("srv_recover_partition[{}]: rejoined raft group OK", boost::uuids::to_string(group_id));
+    return {};
+}
 
 } // namespace craft

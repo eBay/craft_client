@@ -85,6 +85,7 @@ private:
     void internal_login(InternalLoginMsg m);
     void raft_init();
     void replica_init(std::string const& replica_config_path);
+    void recover_partitions();
     void journal_init();
     void state_init();
     void persist_state(); // called under mu_

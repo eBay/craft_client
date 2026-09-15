@@ -25,6 +25,17 @@ public:
         return ptr ? *ptr : nullptr;
     }
 
+    template < typename T >
+    std::vector< std::pair< std::string, std::shared_ptr< T > > > get_prefix(std::string const& prefix) const {
+        std::lock_guard lock(component_mutex_);
+        std::vector< std::pair< std::string, std::shared_ptr< T > > > result;
+        for (auto const& [key, val] : component_store_) {
+            if (!key.starts_with(prefix)) continue;
+            if (auto const* ptr = std::any_cast< std::shared_ptr< T > >(&val)) result.emplace_back(key, *ptr);
+        }
+        return result;
+    }
+
 private:
     mutable std::mutex component_mutex_;
     std::unordered_map< std::string, std::any > component_store_;

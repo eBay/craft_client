@@ -209,6 +209,21 @@ void RaftReplica::raft_init() {
     LOGDEBUG("RaftReplica constructed [id={}] lba_size={}", boost::uuids::to_string(ep_.id), page_size_);
 }
 
+void RaftReplica::recover_partitions() {
+    auto reg = registry_mgr_.lock();
+    if (!reg) { return; }
+    auto const prefix = partition_info_key_prefix + "_";
+    for (auto const& [key, _] : reg->get_prefix< partition_peers_list_t >(prefix)) {
+        auto const partition_uuid = boost::uuids::string_generator()(key.substr(prefix.size()));
+        LOGINFO("recover_partitions[{}]: rejoining partition {}", boost::uuids::to_string(ep_.id),
+                boost::uuids::to_string(partition_uuid));
+        if (auto const r = raft_service_->srv_recover_partition(partition_uuid); !r) {
+            LOGERROR("recover_partitions[{}]: failed to rejoin partition {}", boost::uuids::to_string(ep_.id),
+                     boost::uuids::to_string(partition_uuid));
+        }
+    }
+}
+
 void RaftReplica::journal_init() {
     auto reg = registry_mgr_.lock();
     if (!reg) {
@@ -261,7 +276,10 @@ RaftReplica::RaftReplica(raft_replica_params params) :
         commit_worker_{std::make_unique< RaftReplica::RaftCommitWorker >()},
         registry_mgr_{std::move(params.registry_mgr)} {
     replica_init(params.replica_config_path);
-    if (params.init_raft_service) { raft_init(); }
+    if (params.init_raft_service) {
+        raft_init();
+        recover_partitions();
+    }
     journal_init();
     state_init();
 
@@ -616,7 +634,6 @@ void RaftReplica::apply_sync(boost::uuids::uuid const& partition_uuid, SyncRSCom
 
     std::lock_guard< std::mutex > g{mu_};
     apply_up_to(m.rs_commit_lsn);
-    state_.commit_lsn = m.rs_commit_lsn;
     on_state_changed();
     LOGDEBUG("apply_sync[partition={}]: done, commit_lsn now {} (target rs_commit_lsn={})",
              boost::uuids::to_string(partition_uuid), state_.commit_lsn, m.rs_commit_lsn);
