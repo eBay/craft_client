@@ -49,7 +49,11 @@ std::shared_ptr< std::vector< uint8_t > > take_payload(sisl::sg_list const& s) {
 } // namespace
 
 MemCraftReplica::MemCraftReplica(replica_endpoint ep, uint32_t page_size, std::shared_ptr< MemTransport > net) :
-        ep_{std::move(ep)}, page_size_{page_size}, net_{std::move(net)} {
+        ep_{std::move(ep)},
+        page_size_{page_size},
+        net_{std::move(net)},
+        journal_{std::make_shared< journal_t >()},
+        index_{std::make_shared< index_t >()} {
     // Publish the initial (healthy) fault snapshot before any IO can read it.
     auto initial = std::make_unique< replica_faults const >();
     faults_.store(initial.get(), std::memory_order_release);
@@ -234,7 +238,7 @@ result< lsn_pair > MemCraftReplica::do_write(client_hdr hdr, int64_t dlsn, uint6
     }
     std::lock_guard< std::mutex > g{mu_};
     if (hdr.term != state_.term) return fail(craft_error::STALE_TERM);
-    if (auto it = journal_.find(dlsn); it != journal_.end() && it->second.is_empty) {
+    if (auto it = journal_->find(dlsn); it != journal_->end() && it->second.is_empty) {
         // An Empty verdict is permanent (reconciliation: Empty beats data). A late arrival into the slot is
         // REJECTED -- deterministically -- so that write's own ack path concludes the slot is void, matching
         // the verdict instead of phantom-acking a write every replica discarded.
@@ -247,9 +251,10 @@ result< lsn_pair > MemCraftReplica::do_write(client_hdr hdr, int64_t dlsn, uint6
     slot.len = static_cast< lba_count_t >(len / page_size_); // byte length -> block count
     slot.all_zeros = !bytes;                                 // no payload => zero write; no all_zeros flag
     slot.bytes = std::move(bytes);                           // adopt the buffer; do not copy it again
-    journal_[dlsn] = std::move(slot);
+    (*journal_)[dlsn] = std::move(slot);
     state_.last_append_lsn = std::max(state_.last_append_lsn, dlsn);
     apply_up_to(hdr.commit_lsn); // piggybacked commit: advance the frontier best-effort, in dLSN order
+    on_state_changed();
     // Piggyback the watermarks on the ack (the wire's write_rsp), so any round-trip refreshes the client.
     return lsn_pair{state_.commit_lsn, state_.last_append_lsn};
 }
@@ -286,8 +291,9 @@ result< lsn_pair > MemCraftReplica::do_lsns() {
 
 status MemCraftReplica::do_truncate(int64_t lsn) {
     std::lock_guard< std::mutex > g{mu_};
-    journal_.erase(journal_.upper_bound(lsn), journal_.end());
+    journal_->erase(journal_->upper_bound(lsn), journal_->end());
     state_.last_append_lsn = std::min(state_.last_append_lsn, lsn);
+    on_state_changed();
     return ok();
 }
 
@@ -295,8 +301,8 @@ result< std::vector< JournalSlot > > MemCraftReplica::do_fetch(std::vector< int6
     std::lock_guard< std::mutex > g{mu_};
     std::vector< JournalSlot > out;
     for (auto lsn : lsns) {
-        auto it = journal_.find(lsn);
-        if (it == journal_.end()) continue; // not-present-here => omit
+        auto it = journal_->find(lsn);
+        if (it == journal_->end()) continue; // not-present-here => omit
         auto const& s = it->second;
         JournalSlot js;
         js.lsn = lsn;
@@ -322,12 +328,12 @@ result< resolution_result > MemCraftReplica::do_resolve_local(client_hdr hdr, in
     if (hdr.term != state_.term) return fail(craft_error::STALE_TERM);
     resolution_result out{upto, {}};
     for (int64_t d = state_.commit_lsn + 1; d <= upto; ++d) {
-        auto it = journal_.find(d);
-        if (it == journal_.end()) {
+        auto it = journal_->find(d);
+        if (it == journal_->end()) {
             MemJournalSlot s;
             s.term = state_.term;
             s.is_empty = true;
-            journal_[d] = std::move(s);
+            (*journal_)[d] = std::move(s);
             out.empty_slots.push_back(d);
         } else if (it->second.is_empty) {
             out.empty_slots.push_back(d); // a prior verdict; re-report it so the client can retire the slot
@@ -335,6 +341,7 @@ result< resolution_result > MemCraftReplica::do_resolve_local(client_hdr hdr, in
     }
     state_.last_append_lsn = std::max(state_.last_append_lsn, upto);
     apply_up_to(upto);
+    on_state_changed();
     return out;
 }
 
@@ -343,11 +350,11 @@ result< resolution_result > MemCraftReplica::do_resolve_local(client_hdr hdr, in
 void MemCraftReplica::apply_slot(int64_t dlsn, MemJournalSlot const& s) {
     if (s.all_zeros) {
         for (lba_count_t i = 0; i < s.len; ++i) {
-            index_.erase(s.lba + i); // unmap => hole
+            index_->erase(s.lba + i); // unmap => hole
         }
     } else {
         for (lba_count_t i = 0; i < s.len; ++i) {
-            index_[s.lba + i] = IndexCell{dlsn, s.bytes, static_cast< std::size_t >(i) * page_size_};
+            (*index_)[s.lba + i] = IndexCell{dlsn, s.bytes, static_cast< std::size_t >(i) * page_size_};
         }
     }
 }
@@ -355,8 +362,8 @@ void MemCraftReplica::apply_slot(int64_t dlsn, MemJournalSlot const& s) {
 void MemCraftReplica::apply_up_to(int64_t target) {
     int64_t next = state_.commit_lsn + 1;
     while (next <= target) {
-        auto it = journal_.find(next);
-        if (it == journal_.end()) break; // Missing hole -> stall (best-effort)
+        auto it = journal_->find(next);
+        if (it == journal_->end()) break; // Missing hole -> stall (best-effort)
         if (!it->second.is_empty) apply_slot(next, it->second);
         state_.commit_lsn = next; // Empty slots are skipped on apply but still advance the frontier
         ++next;
@@ -366,7 +373,7 @@ void MemCraftReplica::apply_up_to(int64_t target) {
 // Highest-dLSN journal-tail slot with commit_lsn < dLSN <= H that covers `x` (the journal-tail overlay,
 // materialized on demand). Slots above H are never examined -- that is the horizon clamp.
 MemCraftReplica::MemJournalSlot const* MemCraftReplica::highest_slot_le(lba_t x, int64_t H) const {
-    for (auto it = journal_.upper_bound(H); it != journal_.begin();) {
+    for (auto it = journal_->upper_bound(H); it != journal_->begin();) {
         --it;
         if (it->first <= state_.commit_lsn) break; // reached the applied prefix (served from index_)
         auto const& s = it->second;
@@ -416,7 +423,7 @@ std::vector< io_extent > MemCraftReplica::read_range(int64_t H, uint64_t addr, u
                 page = s->bytes->data() + static_cast< std::size_t >(x - s->lba) * page_size_;
                 hole = false;
             } // else: zero write => hole
-        } else if (auto it = index_.find(x); it != index_.end()) {
+        } else if (auto it = index_->find(x); it != index_->end()) {
             page = it->second.buf->data() + it->second.off;
             hole = false;
         }
@@ -450,14 +457,14 @@ replica_stats MemCraftReplica::stats() const {
     s.last_append_lsn = state_.last_append_lsn;
     s.term = state_.term;
     s.client_token = state_.client_token;
-    s.mapped_blocks = index_.size();
+    s.mapped_blocks = index_->size();
 
-    s.journal_slots = journal_.size();
-    if (!journal_.empty()) {
-        s.journal_first_dlsn = journal_.begin()->first;
-        s.journal_last_dlsn = journal_.rbegin()->first;
+    s.journal_slots = journal_->size();
+    if (!journal_->empty()) {
+        s.journal_first_dlsn = journal_->begin()->first;
+        s.journal_last_dlsn = journal_->rbegin()->first;
     }
-    for (auto const& [dlsn, slot] : journal_) {
+    for (auto const& [dlsn, slot] : (*journal_)) {
         if (slot.is_empty) {
             ++s.empty_slots;
         } else if (slot.all_zeros) {
@@ -473,8 +480,8 @@ replica_stats MemCraftReplica::stats() const {
     int64_t const lo = state_.commit_lsn + 1;
     int64_t const hi = state_.last_append_lsn;
     if (hi >= lo) {
-        auto const first = journal_.lower_bound(lo);
-        auto const last = journal_.upper_bound(hi);
+        auto const first = journal_->lower_bound(lo);
+        auto const last = journal_->upper_bound(hi);
         auto const present = static_cast< std::size_t >(std::distance(first, last));
         s.missing_count = static_cast< std::size_t >(hi - lo + 1) - present;
 
@@ -508,31 +515,34 @@ void MemCraftReplica::cold_apply_login(uint64_t client_token, uint64_t term) {
     std::lock_guard< std::mutex > g{mu_};
     state_.client_token = client_token;
     state_.term = term;
+    on_state_changed();
 }
 void MemCraftReplica::cold_apply_logout() {
     std::lock_guard< std::mutex > g{mu_};
     state_.client_token = 0;
     state_.term = 0; // no active session; subsequent IOs with old term fail STALE_TERM
+    on_state_changed();
 }
 void MemCraftReplica::cold_truncate_above(int64_t rs_commit_lsn) {
     std::lock_guard< std::mutex > g{mu_};
-    journal_.erase(journal_.upper_bound(rs_commit_lsn), journal_.end());
+    journal_->erase(journal_->upper_bound(rs_commit_lsn), journal_->end());
     state_.last_append_lsn = std::min(state_.last_append_lsn, rs_commit_lsn);
+    on_state_changed();
 }
 
 // ── resolution-round hooks (driven by MemTransport::run_resolution) ──
 
 std::optional< MemCraftReplica::MemJournalSlot > MemCraftReplica::peek_slot(int64_t dlsn) {
     std::lock_guard< std::mutex > g{mu_};
-    auto const it = journal_.find(dlsn);
-    if (it == journal_.end()) return std::nullopt;
+    auto const it = journal_->find(dlsn);
+    if (it == journal_->end()) return std::nullopt;
     return it->second; // copies the slot; `bytes` is shared (immutable once appended), so no payload copy
 }
 
 void MemCraftReplica::cold_install_slot(int64_t dlsn, MemJournalSlot s) {
     std::lock_guard< std::mutex > g{mu_};
-    if (journal_.contains(dlsn)) return; // already holds it (or a verdict); a fetch never overwrites
-    journal_[dlsn] = std::move(s);
+    if (journal_->contains(dlsn)) return; // already holds it (or a verdict); a fetch never overwrites
+    (*journal_)[dlsn] = std::move(s);
     state_.last_append_lsn = std::max(state_.last_append_lsn, dlsn);
 }
 
@@ -543,14 +553,14 @@ void MemCraftReplica::cold_mark_empty(int64_t dlsn) {
     MemJournalSlot s;
     s.term = state_.term;
     s.is_empty = true;
-    journal_[dlsn] = std::move(s);
+    (*journal_)[dlsn] = std::move(s);
     state_.last_append_lsn = std::max(state_.last_append_lsn, dlsn);
 }
 
 std::vector< int64_t > MemCraftReplica::peek_empties(int64_t upto) {
     std::lock_guard< std::mutex > g{mu_};
     std::vector< int64_t > out;
-    for (auto const& [d, s] : journal_) {
+    for (auto const& [d, s] : (*journal_)) {
         if (d > upto) break;
         if (s.is_empty) out.push_back(d); // ascending: journal_ is an ordered map
     }

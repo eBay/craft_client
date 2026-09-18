@@ -17,7 +17,7 @@ class ClusterManager:
         self.config_path = config_path
         self.members = members
         lvl = log_level_dict[verbose]
-        self.log_args = f"base:{lvl},nuraft_mesg:info"
+        self.log_args = f"base:{lvl}"
         self.procs: dict[str, subprocess.Popen] = {}
 
     def start_all(self):
