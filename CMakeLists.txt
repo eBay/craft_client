@@ -29,11 +29,18 @@ find_package(GTest REQUIRED)
 find_package(sisl REQUIRED)
 find_package(liburing REQUIRED)
 find_package(NuraftMesg REQUIRED)
+find_package(OpenSSL REQUIRED)
 
 # ── craft_wire: the std-only wire codec LEAF (the future standalone dependency) ──
 add_library(craft_wire STATIC src/wire.cpp)
 target_include_directories(craft_wire PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_compile_features(craft_wire PUBLIC cxx_std_23)
+
+# ── craft_auth: the AUTH proof helper; std-only header, OpenSSL behind it ──
+add_library(craft_auth STATIC src/auth.cpp)
+target_include_directories(craft_auth PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_link_libraries(craft_auth PRIVATE OpenSSL::Crypto)
+target_compile_features(craft_auth PUBLIC cxx_std_23)
 
 # ── craft_types: the domain vocabulary ONLY (header-only; result carrier from sisl). A storage
 # backend also needs craft_client for craft_peer and the peer codec. ──
@@ -49,13 +56,14 @@ add_library(craft_client STATIC
   src/peer_codec.cpp
   src/net/conn.cpp
   src/net/wire_client.cpp
+  src/net/auth_client.cpp
   src/net/async_conn.cpp # the P2 on-ring TCP data path (recv-demux pump); internal, behind tcp_replica
   src/net/session_mgr.cpp # the ONE process-wide admin thread every proxy shares (login/logout + the no-ring tier)
   src/net/tcp_replica.cpp
   src/net/tcp_cluster.cpp) # craft/tcp.hpp: the public "connect to remote servers" backend builder
 target_include_directories(craft_client PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_include_directories(craft_client PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src) # internal headers (dlsn_tracker, ...)
-target_link_libraries(craft_client PUBLIC craft_wire craft_types sisl::sisl liburing::liburing)
+target_link_libraries(craft_client PUBLIC craft_wire craft_auth craft_types sisl::sisl liburing::liburing)
 target_compile_features(craft_client PUBLIC cxx_std_23)
 
 # ── craft_reference: the in-memory reference model and the local cluster builder used by the client
@@ -107,6 +115,10 @@ add_executable(test_wire test/test_wire.cpp)
 target_link_libraries(test_wire PRIVATE craft_wire GTest::gtest GTest::gtest_main)
 add_test(NAME CraftWire COMMAND test_wire)
 
+add_executable(test_auth test/test_auth.cpp)
+target_link_libraries(test_auth PRIVATE craft_auth GTest::gtest GTest::gtest_main)
+add_test(NAME CraftAuth COMMAND test_auth)
+
 # sisl-linking tests provide their own main (test_main.cpp) so boost's test_exec_monitor is not pulled.
 add_executable(test_types test/test_types.cpp test/test_main.cpp)
 target_link_libraries(test_types PRIVATE craft_types GTest::gtest)
@@ -129,13 +141,14 @@ craft_test(test_tcp          raft_tcp_server)
 craft_test(test_tcp_replica  cluster_server)
 craft_test(test_async_mem    craft_reference) # the on-ring async transport (prepare_for_async) driven at depth
 craft_test(test_async_tcp    cluster_server) # the on-ring TCP transport (recv-demux pump) over real loopback sockets
+craft_test(test_auth_handshake raft_tcp_server) # client-side AUTH on both connect paths, against a scripted replica
 
 # Every suite EXCEPT test_wire / test_types / test_api reaches an internal header under src/ -- the reference
 # model, the TCP server/proxy, the craft_replica interface, the dlsn_tracker. That is the point of the split:
 # those types are NOT on the public surface, so only in-repo code may name them. test_api is deliberately left
 # out: it must compile against include/ alone, and it fails loudly if the public surface ever stops sufficing.
 foreach(t test_tcp_builder test_memory test_dlsn_tracker test_cluster test_tcp test_tcp_replica
-          test_async_mem test_async_tcp)
+          test_async_mem test_async_tcp test_auth_handshake)
   target_include_directories(${t} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
 endforeach()
 

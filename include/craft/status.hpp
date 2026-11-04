@@ -56,6 +56,12 @@ inline std::error_condition status_to_error(wire::status s) {
         return make_error_condition(craft_error::REPLICA_DOWN);
     case wire::status::invalid_argument:
         return std::make_error_condition(std::errc::invalid_argument);
+    case wire::status::not_exposed:
+    case wire::status::stale_credential:
+    case wire::status::auth_failed:
+        // AUTH-only statuses (the AUTH replies are mapped by the transport, not here). On any other reply they
+        // are a protocol violation, so the op is not provably undelivered: treat it like a lost reply.
+        return std::make_error_condition(std::errc::timed_out);
     default:
         return make_error_condition(craft_error::REPLICA_DOWN);
     }

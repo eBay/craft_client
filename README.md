@@ -55,6 +55,7 @@ reference model, the TCP proxy/client/server) lives under `src/` and is not ship
 | `craft/client.hpp` | **drivers** -- a ublk disk, a test, an app | `client_handle` + `make_client` + `login`/`write`/`read`/`flush`/`logout`/`drive_keepalives` + observers |
 | `craft/tcp.hpp`, `craft/local.hpp` | **drivers**, assembling a binary | backend builders `make_tcp_cluster` / `make_local_cluster` → an **opaque handle**; `backends(handle)` feeds `make_client` |
 | `craft/wire.hpp`, `craft/status.hpp` | **server authors** (the future `CraftConnector`) | the codec + the wire↔`craft_error` bridge |
+| `craft/auth.hpp` | **server authors** | the AUTH proof helper both ends hash through (`compute_proof`, `make_nonce`, `proofs_equal`) |
 | `craft/net/conn.hpp` | **server authors** | the socket + message framing (`recv_message` / `send_all`) a wire server terminates on |
 | `craft/peer.hpp` | **storage backend** | the peer communication interface + methods for serialize/deserialize peer API objects |
 

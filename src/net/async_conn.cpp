@@ -14,6 +14,7 @@
  *********************************************************************************/
 
 #include "net/async_conn.hpp"
+#include "net/auth_client.hpp"
 
 #include <cerrno>
 #include <cstring>
@@ -39,8 +40,9 @@ std::span< uint8_t const > as_bytes(T const& v) {
 constexpr std::size_t k_recv_chunk = 64 * 1024; // per-recv landing size; a message may span several recvs
 } // namespace
 
-craft_async_conn::craft_async_conn(std::string host, uint16_t port, uint32_t max_tx, ::io_uring* ring) :
-        host_{std::move(host)}, port_{port}, max_tx_{max_tx}, ring_{ring} {}
+craft_async_conn::craft_async_conn(std::string host, uint16_t port, uint32_t max_tx, ::io_uring* ring,
+                                   std::optional< auth_credential > cred) :
+        host_{std::move(host)}, port_{port}, max_tx_{max_tx}, ring_{ring}, cred_{std::move(cred)} {}
 
 craft_async_conn::~craft_async_conn() { shutdown(); }
 
@@ -53,6 +55,11 @@ craft_async_conn::~craft_async_conn() { shutdown(); }
 
 void craft_async_conn::drop_fd() noexcept {
     if (fd_ >= 0) {
+        // close() alone neither completes the pump's in-flight recv nor sends a FIN: the ring holds its own file
+        // reference. shutdown() does both, so the pump reaches final_suspend and the peer sees the close. Submit
+        // first: a recv still queued in the SQ would otherwise resolve fd_ after close(), possibly to a reused fd.
+        (void)::io_uring_submit(ring_);
+        ::shutdown(fd_, SHUT_RDWR);
         ::close(fd_);
         fd_ = -1;
     }
@@ -96,7 +103,12 @@ void craft_async_conn::shutdown() noexcept {
         pump_.destroy();
         pump_ = {};
     }
-    drop_fd();
+    // close() only, not drop_fd(): its ::shutdown would complete the destroyed pump's recv onto the ring.
+    if (fd_ >= 0) {
+        ::close(fd_);
+        fd_ = -1;
+    }
+    ready_ = false;
     fail_all();
 }
 
@@ -231,12 +243,20 @@ craft_async_conn::round_trip(wire::op o, std::span< uint8_t const > op_hdr, std:
 sisl::async::light_task< std::expected< void, net_error > >
 craft_async_conn::ensure_ready(std::array< uint8_t, 16 > const& vol, uint64_t token, uint64_t term) {
     if (ready_) co_return std::expected< void, net_error >{};
+    if (auth_rejected_) co_return std::unexpected(*auth_rejected_);
     if (connecting_) {
         // Another op is establishing the connection (QD>1); park until it finishes, then re-check.
         co_await connect_awaitable{this};
         if (ready_) co_return std::expected< void, net_error >{};
-        co_return std::unexpected(net_error::connect);
+        co_return std::unexpected(auth_rejected_.value_or(net_error::connect));
     }
+    if (cred_ && !auth_client::usable(cred_->username, cred_->password)) {
+        auth_rejected_ = net_error::auth_failed;
+        co_return std::unexpected(net_error::auth_failed);
+    }
+    // A failed handshake left the old pump's recv in flight (drop_fd shut the socket, but its completion is not
+    // reaped yet). Its frame can be reclaimed only once it reaches final_suspend; nothing was sent this time.
+    if (pump_ && !pump_.done()) co_return std::unexpected(net_error::connect);
     connecting_ = true;
 
     // Clears connecting_ and resumes every op that parked behind us, then yields `r` as our own result.
@@ -271,9 +291,21 @@ craft_async_conn::ensure_ready(std::array< uint8_t, 16 > const& vol, uint64_t to
     pump_ = std::exchange(pt._coro, {});
     pump_.resume();
 
+    if (cred_) {
+        if (auto a = co_await authenticate(vol); !a) {
+            if (is_auth_rejection(a.error())) auth_rejected_ = a.error();
+            LOGDEBUG("craft_async_conn[{}:{}] AUTH failed (net_error={})", host_, port_, static_cast< int >(a.error()));
+            drop_fd();
+            co_return finish(std::unexpected(a.error()));
+        }
+    }
+
     wire::helo_req req{vol, token, term};
     auto reply = co_await round_trip(wire::op::helo, as_bytes(req), {});
-    if (!reply) co_return finish(std::unexpected(reply.error()));
+    if (!reply) {
+        drop_fd();
+        co_return finish(std::unexpected(reply.error()));
+    }
     auto parsed = wire::parse_message(*reply, max_tx_);
     if (!parsed || parsed->hdr.op != static_cast< uint8_t >(wire::op::helo_rsp)) {
         drop_fd();
@@ -288,6 +320,25 @@ craft_async_conn::ensure_ready(std::array< uint8_t, 16 > const& vol, uint64_t to
     ready_ = true;
     LOGTRACE("craft_async_conn[{}:{}] ready (HELO'd at term={}, client_token=)", host_, port_, term, token);
     co_return finish(std::expected< void, net_error >{});
+}
+
+sisl::async::light_task< std::expected< void, net_error > >
+craft_async_conn::authenticate(std::array< uint8_t, 16 > const& vol) {
+    auto ac = auth_client::begin(vol, cred_->username, cred_->password);
+    if (!ac) co_return std::unexpected(ac.error());
+
+    auto reply = co_await round_trip(wire::op::auth_start, ac->start_header(), ac->start_body());
+    if (!reply) co_return std::unexpected(reply.error());
+    auto parsed = wire::parse_message(*reply, max_tx_);
+    if (!parsed) co_return std::unexpected(net_error::malformed);
+    auto const proof = ac->on_challenge(*parsed);
+    if (!proof) co_return std::unexpected(proof.error());
+
+    reply = co_await round_trip(wire::op::auth_proof, as_bytes(*proof), {});
+    if (!reply) co_return std::unexpected(reply.error());
+    parsed = wire::parse_message(*reply, max_tx_);
+    if (!parsed) co_return std::unexpected(net_error::malformed);
+    co_return ac->on_result(*parsed);
 }
 
 // ── IO ops ──

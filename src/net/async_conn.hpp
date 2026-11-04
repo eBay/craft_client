@@ -33,6 +33,7 @@
 #include <coroutine>
 #include <cstdint>
 #include <expected>
+#include <optional>
 #include <span>
 #include <string>
 #include <unordered_map>
@@ -45,6 +46,7 @@
 #include <sisl/async/light_task.hpp> // sisl::async::light_task<T>: freestanding, resumes on the completing thread
 
 #include <craft/net/conn.hpp>  // net_error
+#include <craft/types.hpp>     // auth_credential
 #include "net/wire_client.hpp" // lsn_reply / read_reply
 #include <craft/wire.hpp>      // op / frame_message / parse_message
 
@@ -56,14 +58,16 @@ public:
     // (ublk's run_queue_loop or a test) drives completion via sisl::async::complete_cqe_state. `max_tx` is the max
     // framed BODY the transport may parse -- NOT the payload, but wire::framed_body_max(payload, lba): the payload
     // plus a read reply's extent table, so a full-payload read still fits. Nothing connects until first ensure_ready.
-    craft_async_conn(std::string host, uint16_t port, uint32_t max_tx, ::io_uring* ring);
+    // A `cred` makes every (re)connect AUTH before HELO.
+    craft_async_conn(std::string host, uint16_t port, uint32_t max_tx, ::io_uring* ring,
+                     std::optional< auth_credential > cred = std::nullopt);
     ~craft_async_conn();
     craft_async_conn(craft_async_conn const&) = delete;
     craft_async_conn& operator=(craft_async_conn const&) = delete;
 
-    // Lazy connect + HELO(vol, token, term) + arm the recv pump, on the ring. Idempotent while ready; after a
-    // fault the fd was dropped, so this reconnects. A follower/leader distinction is irrelevant here -- HELO
-    // binds this data fd to the already-established session by term.
+    // Lazy connect + arm the recv pump + AUTH (if a credential) + HELO(vol, token, term), on the ring. Idempotent while
+    // ready; after a fault the fd was dropped, so this reconnects. A follower/leader distinction is irrelevant here --
+    // HELO binds this data fd to the already-established session by term.
     sisl::async::light_task< std::expected< void, net_error > > ensure_ready(std::array< uint8_t, 16 > const& vol,
                                                                              uint64_t token, uint64_t term);
 
@@ -140,6 +144,9 @@ private:
     sisl::async::light_task< std::expected< std::vector< uint8_t >, net_error > >
     round_trip(wire::op o, std::span< uint8_t const > op_hdr, std::span< uint8_t const > body);
 
+    // The AUTH exchange over round_trip, on a freshly connected fd with the pump armed. Fail-closed.
+    sisl::async::light_task< std::expected< void, net_error > > authenticate(std::array< uint8_t, 16 > const& vol);
+
     // socket() + async IORING_OP_CONNECT on the ring; sets fd_. Returns 0 on success, <0 (-errno) on failure.
     sisl::async::light_task< int > ring_connect();
     // Send all of `data`, looping over partial sends via IORING_OP_SEND on the ring. 0 ok, <0 on error.
@@ -158,6 +165,8 @@ private:
     uint16_t port_;
     uint32_t max_tx_;
     ::io_uring* ring_{nullptr};
+    std::optional< auth_credential > cred_;
+    std::optional< net_error > auth_rejected_; // sticky: the replica refused cred_ (see is_auth_rejection)
     int fd_{-1};
     bool ready_{false};
     bool stopping_{false};

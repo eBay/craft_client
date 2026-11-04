@@ -61,9 +61,10 @@ public:
     // Address the replica at host:port; `id` is its endpoint id (routing), `volume_id` is what HELO presents
     // to bind a follower connection to the session. `op_timeout` (0 = none) bounds every reply wait -- past it
     // an op returns timed_out and the connection is reset (reconnect + re-HELO on the next op). Nothing
-    // connects until the first op (on the session-mgr thread).
+    // connects until the first op (on the session-mgr thread). A `credential` makes every connection AUTH first.
     CraftTcpReplica(std::string host, uint16_t port, peer_id_t id, std::array< uint8_t, 16 > volume_id,
-                    std::chrono::milliseconds op_timeout = std::chrono::milliseconds{0});
+                    std::chrono::milliseconds op_timeout = std::chrono::milliseconds{0},
+                    std::optional< auth_credential > credential = std::nullopt);
     ~CraftTcpReplica() override;
 
     CraftTcpReplica(CraftTcpReplica const&) = delete;
@@ -127,7 +128,8 @@ private:
     std::shared_ptr< hop_event > hop();
 
     // Session-mgr-thread-only state (this proxy's blocking ops all run serially there, so no lock guards these).
-    bool ensure_connected(); // lazy connect on first use
+    // Lazy connect (+ AUTH when a credential is set) on first use. nullopt = connected; else why it could not.
+    std::optional< std::error_condition > ensure_connected();
     // Lazy HELO for a follower connection (login binds the leader's). nullopt = bound; else why it could not be.
     std::optional< std::error_condition > ensure_bound(uint64_t term, uint64_t client_token);
     // Map a transport fault to the domain error AND, for any connection-level fault (timed out / closed / send
@@ -140,6 +142,8 @@ private:
     peer_id_t id_;
     std::array< uint8_t, 16 > vol_id_;
     std::chrono::milliseconds op_timeout_{0}; // forwarded onto conn_ at connect; 0 = block forever
+    std::optional< auth_credential > cred_;
+    std::optional< std::error_condition > auth_rejected_; // sticky, session-mgr thread only (see is_auth_rejection)
 
     net::wire_client conn_; // touched ONLY on the session-mgr thread (login/logout: the blocking admin path)
 

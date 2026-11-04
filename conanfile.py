@@ -70,6 +70,7 @@ class CraftClientConan(ConanFile):
         # declared here so the package graph is right from the start.
         self.requires("sisl/[^14.8]@oss/dev", transitive_headers=True)
         self.requires("liburing/[^2.4]", transitive_headers=True)
+        self.requires("openssl/[>=3 <4]")
 
     def validate(self):
         if self.info.settings.compiler.cppstd:
@@ -93,10 +94,11 @@ class CraftClientConan(ConanFile):
         # from the build-folder ROOT (where libcraft_*.a land). This MUST be set PER-COMPONENT: a global
         # self.cpp.build.libdirs does NOT propagate to a component-based cpp_info, so without it an editable
         # consumer falls back to <pkg>/lib and cannot find the libs.
-        for comp in ("craft_wire", "craft_types", "craft_client", "craft_reference"):
+        for comp in ("craft_wire", "craft_auth", "craft_types", "craft_client", "craft_reference"):
             self.cpp.source.components[comp].includedirs = ["include"]
         for comp in (
             "craft_wire",
+            "craft_auth",
             "craft_client",
             "craft_reference",
         ):  # craft_types is header-only
@@ -153,12 +155,16 @@ class CraftClientConan(ConanFile):
     def package_info(self):
         # Components, so a consumer links ONLY what it uses and the one-way dependency graph is enforced:
         #   craft_wire   (std leaf)         -> nothing
+        #   craft_auth   (AUTH proofs)      -> openssl::crypto
         #   craft_types  (header-only)      -> sisl                     (the vocabulary + craft_replica iface)
-        #   craft_client (client+transport) -> craft_wire, craft_types, sisl, liburing   (the PRODUCTION surface)
+        #   craft_client (client+transport) -> craft_wire, craft_auth, craft_types, sisl, liburing   (the PRODUCTION surface)
         #   craft_reference (mem+servers)   -> craft_client             (TEST-SUPPORT ONLY)
         # A product consumer (libhomeblocks: just the vocab; ublkpp craft_disk: the client) never pulls
         # craft_reference; only tests link it.
         self.cpp_info.components["craft_wire"].libs = ["craft_wire"]
+
+        self.cpp_info.components["craft_auth"].libs = ["craft_auth"]
+        self.cpp_info.components["craft_auth"].requires = ["openssl::crypto"]
 
         self.cpp_info.components["craft_types"].libs = []  # header-only
         self.cpp_info.components["craft_types"].requires = ["sisl::sisl"]
@@ -166,6 +172,7 @@ class CraftClientConan(ConanFile):
         self.cpp_info.components["craft_client"].libs = ["craft_client"]
         self.cpp_info.components["craft_client"].requires = [
             "craft_wire",
+            "craft_auth",
             "craft_types",
             "sisl::sisl",
             "liburing::liburing",

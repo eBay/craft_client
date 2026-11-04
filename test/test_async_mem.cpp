@@ -46,6 +46,7 @@
 #include "mem/cluster.hpp"   // make_mem_replica_group (the reference set + its replicas)
 #include "mem/replica.hpp"   // MemCraftReplica::set_delay / stats()
 
+#include "ring_driver.hpp"     // ring_driver: the test-owned io_uring + reap loop
 #include "craft_test_util.hpp" // rg (sync_get, for the pool-path login), PAGE, blk, one_iov, page_of
 #include "dlsn_tracker.hpp"    // white-box: tracker_stats fields (issued / unresolved_count) for the depth proof
 
@@ -54,59 +55,6 @@ using namespace craft::test;
 
 namespace {
 constexpr uint64_t TOKEN = 0xC0FFEEULL;
-
-// A driver-owned io_uring + the reap loop a ublk queue runs in production: submit the SQEs the transport queued,
-// wait a slice for a CQE, then drain every ready one -- completing each managed sisl::async::cqe_state so its
-// suspended leg resumes. This IS the "driver drives the reaping" contract the async verb overloads document;
-// the transport only ever queues SQEs. Mirrors ublkpp::MockUblksrv::poll and io_uring_scheduler::poll_once.
-struct ring_driver {
-    ::io_uring ring{};
-
-    explicit ring_driver(unsigned entries) {
-        if (::io_uring_queue_init(entries, &ring, 0) < 0) throw std::runtime_error("io_uring_queue_init failed");
-    }
-    ~ring_driver() { ::io_uring_queue_exit(&ring); }
-    ring_driver(ring_driver const&) = delete;
-    ring_driver& operator=(ring_driver const&) = delete;
-
-    // One reap slice: flush queued SQEs + wait up to `slice` for a CQE (one syscall), then drain all that are
-    // ready. Consume each CQE BEFORE resuming its leg, so a resumed leg's own peek sees the next one, never this.
-    void pump(std::chrono::milliseconds slice) {
-        __kernel_timespec ts{.tv_sec = slice.count() / 1000, .tv_nsec = (slice.count() % 1000) * 1'000'000LL};
-        ::io_uring_cqe* cqe = nullptr;
-        int const r = ::io_uring_submit_and_wait_timeout(&ring, &cqe, 1, &ts, nullptr);
-        if (r < 0 || nullptr == cqe) return; // -ETIME / -EINTR: no completion this slice
-        do {
-            uint64_t const ud = cqe->user_data;
-            int const res = cqe->res;
-            ::io_uring_cqe_seen(&ring, cqe);
-            if (sisl::async::is_managed_user_data(ud)) {
-                if (auto* s = static_cast< sisl::async::cqe_state* >(sisl::async::decode_managed_user_data(ud))) {
-                    sisl::async::complete_cqe_state(*s, res);
-                }
-            }
-        } while (0 == ::io_uring_peek_cqe(&ring, &cqe) && nullptr != cqe);
-    }
-
-    // Pump until `pred()` holds, bounded so a hung leg fails the assertion instead of spinning forever.
-    template < class Pred >
-    bool drive_until(Pred pred, int max_slices = 4000) {
-        for (int i = 0; i < max_slices; ++i) {
-            if (pred()) return true;
-            pump(std::chrono::milliseconds{2});
-        }
-        return pred();
-    }
-
-    // Keep reaping for `wall`, to drain any still-detached straggler legs (e.g. a slow replica's keep_alive a
-    // read left running) so no ring SQE points at a live coroutine frame when the cluster is torn down.
-    void drain_for(std::chrono::milliseconds wall) {
-        auto const deadline = std::chrono::steady_clock::now() + wall;
-        while (std::chrono::steady_clock::now() < deadline) {
-            pump(std::chrono::milliseconds{2});
-        }
-    }
-};
 
 // Named wrappers, NOT capturing-lambda coroutines: a lambda coroutine's frame dangles its captures after the
 // first suspend. Params by value; the buffer each sg_list points at is the test's, alive across the whole drive.

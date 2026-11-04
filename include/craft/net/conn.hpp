@@ -42,6 +42,9 @@ enum class net_error {
     malformed,        // the framing was invalid (unknown op / bad length / bad digest)
     invalid_argument, // a client call precondition failed (e.g. a read dest smaller than the read length)
     timed_out,        // no reply within the op deadline; the connection is left needing a reset
+    not_exposed,      // AUTH: the replica holds no credential for the volume
+    stale_credential, // AUTH: the replica's credential was rotated
+    auth_failed,      // AUTH: refused, or the replica's proof did not verify
 };
 
 // The default connect deadline. connect() is ALWAYS bounded: a refusing peer errors instantly (RST), so a

@@ -60,7 +60,7 @@ tcp_cluster_handle make_tcp_cluster(std::vector< replica_endpoint > const& membe
         auto const colon = m.addr.rfind(':'); // rfind so an IPv6-ish host with colons keeps only the last field
         auto const host = m.addr.substr(0, colon);
         auto const port = static_cast< uint16_t >(std::stoul(m.addr.substr(colon + 1)));
-        auto proxy = std::make_shared< CraftTcpReplica >(host, port, m.id, vol, op_timeout);
+        auto proxy = std::make_shared< CraftTcpReplica >(host, port, m.id, vol, op_timeout, m.credential);
         backends.push_back(proxy);
         proxies.push_back(std::move(proxy));
     }

@@ -13,10 +13,11 @@
  *
  *********************************************************************************/
 
-// Wire-only: this TU includes only its own header (-> craft_conn + craft_wire) and the standard library. No
-// homeblocks/homestore/sisl symbol enters, so the reference client links standalone.
+// Wire-only: this TU includes only its own header (-> craft_conn + craft_wire), the AUTH client (-> craft_auth), and
+// the standard library. No homeblocks/homestore/sisl symbol enters, so the reference client links standalone.
 
 #include "net/wire_client.hpp"
+#include "net/auth_client.hpp"
 
 #include <cstring>
 #include <utility>
@@ -43,6 +44,32 @@ std::expected< wire_client, net_error > wire_client::connect(std::string const& 
     wire_client cli;
     cli.conn_ = std::move(*c);
     return cli;
+}
+
+std::expected< void, net_error > wire_client::authenticate(std::array< uint8_t, 16 > const& volume_id,
+                                                           std::string_view username, std::string_view password,
+                                                           std::chrono::milliseconds timeout) {
+    auto ac = auth_client::begin(volume_id, username, password);
+    if (!ac) return std::unexpected(ac.error());
+
+    std::vector< uint8_t > out;
+    wire::frame_message(out, wire::op::auth_start, 0, next_rid_++, ac->start_header(), ac->start_body());
+    if (!conn_.send_all(out)) return std::unexpected(net_error::send);
+    auto msg = conn_.recv_message(k_max_tx, timeout);
+    if (!msg) return std::unexpected(msg.error());
+    auto parsed = wire::parse_message(*msg, k_max_tx);
+    if (!parsed) return std::unexpected(net_error::malformed);
+    auto const proof = ac->on_challenge(*parsed);
+    if (!proof) return std::unexpected(proof.error());
+
+    out.clear();
+    wire::frame_message(out, wire::op::auth_proof, 0, next_rid_++, as_bytes(*proof), {});
+    if (!conn_.send_all(out)) return std::unexpected(net_error::send);
+    msg = conn_.recv_message(k_max_tx, timeout);
+    if (!msg) return std::unexpected(msg.error());
+    parsed = wire::parse_message(*msg, k_max_tx);
+    if (!parsed) return std::unexpected(net_error::malformed);
+    return ac->on_result(*parsed);
 }
 
 std::expected< login_result, net_error > wire_client::login(std::array< uint8_t, 16 > const& volume_id,

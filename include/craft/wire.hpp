@@ -84,7 +84,13 @@ enum class op : uint8_t {
     get_rs_commit_lsn_rsp = 18,
     fetch_data = 19,
     fetch_data_rsp = 20,
-    k_max_op = 20, // highest allocated opcode; raise when the peer plane lands
+
+    // Connection-phase AUTH (mutual CHAP), before LOGIN / HELO. See docs/wire.md "Authentication".
+    auth_start = 21,
+    auth_challenge = 22,
+    auth_proof = 23,
+    auth_result = 24,
+    k_max_op = 24, // highest allocated opcode
 };
 
 // Response `status` byte; 1-6 mirror craft_error (craft_types.hpp).
@@ -97,6 +103,9 @@ enum class status : uint8_t {
     not_eligible = 5,
     replica_down = 6,
     invalid_argument = 7,
+    not_exposed = 8,      // AUTH: no credential for the volume on this replica
+    stale_credential = 9, // AUTH: the username is not the replica's current credential
+    auth_failed = 10,     // AUTH: the client's proof did not verify
     internal = 255,
 };
 
@@ -264,6 +273,27 @@ struct fetch_data_rsp {
 };
 // body: slot_count x fetch_slot_desc, THEN the raw data bytes for slots that have real data
 
+// AUTH layouts are independent of the wire version; a new scheme is a new auth_start_req::version.
+constexpr uint16_t k_auth_version = 1;
+constexpr std::size_t k_auth_max_username = 64;
+
+struct auth_start_req {
+    uint16_t version; // k_auth_version
+    uint16_t reserved0;
+    uint32_t reserved1;
+    std::array< uint8_t, 16 > volume_id;
+    std::array< uint8_t, 32 > client_nonce;
+}; // body: username, 1..k_auth_max_username bytes
+struct auth_challenge_rsp {
+    std::array< uint8_t, 32 > server_nonce; // zero-filled on a non-ok status
+};
+struct auth_proof_req {
+    std::array< uint8_t, 32 > client_proof;
+};
+struct auth_result_rsp {
+    std::array< uint8_t, 32 > server_proof; // zero-filled on a non-ok status
+};
+
 #pragma pack(pop)
 
 static_assert(sizeof(msg_hdr) == 8);
@@ -287,6 +317,10 @@ static_assert(sizeof(get_rs_commit_lsn_rsp) == 16);
 static_assert(sizeof(fetch_data_req) == 8);
 static_assert(sizeof(fetch_slot_desc) == 32);
 static_assert(sizeof(fetch_data_rsp) == 8);
+static_assert(sizeof(auth_start_req) == 56);
+static_assert(sizeof(auth_challenge_rsp) == 32);
+static_assert(sizeof(auth_proof_req) == 32);
+static_assert(sizeof(auth_result_rsp) == 32);
 // The fixed operation-header size for an op code (0 for a status-only response). nullopt = unknown op, which
 // is unframeable -- the caller resets the connection.
 std::optional< std::size_t > op_hdr_size(uint8_t op_code) noexcept;
