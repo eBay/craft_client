@@ -4,6 +4,38 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## 0.5.0
+
+### Added
+- **Connection authentication (mutual CHAP, HMAC-SHA-256).** Wire ops 21-24 (`AUTH_START` / `AUTH_CHALLENGE` /
+  `AUTH_PROOF` / `AUTH_RESULT`) and statuses 8-10 (`NOT_EXPOSED`, `STALE_CREDENTIAL`, `AUTH_FAILED`); spec in
+  `docs/wire.md` "Authentication", admission and rotation in `docs/transport.md`.
+- `craft/auth.hpp` + the `craft_auth` component (links `openssl::crypto`): `compute_proof`, `make_nonce`,
+  `proofs_equal`. Client and server hash through it.
+- `replica_endpoint::credential` (`auth_credential { username, password }`). When set, every connection to that
+  replica -- the blocking admin connection and each on-ring data connection, including reconnects -- completes
+  AUTH and verifies the replica's proof before LOGIN / HELO, and never falls back to an unauthenticated one.
+  Unset means no AUTH, which only a non-enforcing replica (the reference server) admits.
+- A refusal (`NOT_EXPOSED` / `STALE_CREDENTIAL` / `AUTH_FAILED`, or a bad replica proof) is final for the
+  credential: that connection stops reconnecting and fails fast until the cluster is rebuilt with new attach info.
+  Any other non-OK AUTH status fails only that attempt. An unusable local credential (empty, or a username over 64
+  bytes) fails the same way without connecting.
+- A connect-phase failure on the on-ring path (connect, AUTH, or HELO, including a HELO the replica rejects) is now
+  reported as `REPLICA_DOWN` rather than `timed_out`: the op was never sent, so it counts toward a write's
+  provably-Empty verdict and a read fails over past it.
+- `status_to_error` maps statuses 8-10 on a non-AUTH reply to `timed_out` (a protocol violation, classified like a
+  lost reply), and `to_wire_status` never produces them.
+- `craft_error::NOT_EXPOSED`, `STALE_CREDENTIAL`, `AUTH_FAILED`. The client treats them as never-delivered:
+  they count toward a write's provably-Empty verdict and a read fails over past them.
+
+### Changed
+- OpenSSL 3 is now a dependency.
+
+### Fixed
+- On-ring connection: a connect that failed after the recv pump was armed (HELO rejected, or a failed HELO send)
+  left the pump's recv in flight, and the next reconnect freed its frame under it (use-after-free). The socket is
+  now `shutdown()` on failure, and the pump is reclaimed only once it has finished.
+
 ## 0.3.0
 
 ### Changed
