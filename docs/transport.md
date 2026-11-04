@@ -62,10 +62,10 @@ opened lazily by its queue's first verb, on that queue's own ring.
   CLOSED
     | tcp connect (to the endpoint in the attach descriptor)
   CONNECTING
-    | tcp established; the replica drops it if the source IP is not on the volume's allow-list
-  INIT        connection-init (ICReq/ICResp): negotiate version + digests
+    | tcp established; the replica drops it if the source IP is not on the volume's allow-list (not yet built)
+  INIT        connection-init (ICReq/ICResp): negotiate version + digests (not yet built)
     | negotiated
-  AUTH        CHAP challenge-response (mutual), using the attach credentials
+  AUTH        mutual CHAP (wire.md AUTH ops 21-24), using the replica's attach credential
     | authenticated
   BINDING     LOGIN (first connection: establish the session) or HELO (bind to an existing one)
     | OK
@@ -80,42 +80,56 @@ connection to CLOSED and schedules a reconnect.
 
 ## Admission and authentication
 
-Access control lives entirely in the transport binding, not in CRAFT. The message layer (`wire.md`) knows
-nothing about credentials; it fences by `term` -- "is this the current session owner?" -- which is a
-different question from "is this connection allowed at all." Two independent gates, both provisioned by the
-control plane, guard a connection before any CRAFT message flows:
+Access control is a connection phase, separate from the session verbs. `LOGIN`, `HELO`, and IO carry no
+credentials; they fence by `term` -- "is this the current session owner?" -- which is a different question
+from "is this connection allowed at all." Two independent gates guard a connection before it may bind:
 
-1. **Source-IP allow-list.** When the control plane exposes a volume to a client, it tells the replica which
-   client IP(s) may connect. The listener drops any connection whose source address is not on that volume's
-   allow-list, at accept, before spending a handshake. Coarse and spoofable on its own, so it narrows
-   exposure rather than authenticates.
-2. **CHAP.** The control plane generates a per-attach credential (a CHAP identity + secret, ephemeral to the
-   attachment) and provisions it to both the replica and the client. In the AUTH phase the replica
-   challenges, the client answers with an HMAC over the challenge keyed by the secret (the secret is never
-   sent), and the replica verifies; **mutual**, so the client also challenges the replica and a rogue
-   endpoint at the advertised address cannot impersonate the volume. Use the NVMe-oF variant --
-   **DH-HMAC-CHAP** (Diffie-Hellman augmented HMAC-SHA-256/384/512) -- over iSCSI's legacy MD5 CHAP, for
-   offline-attack resistance and forward secrecy, keeping us aligned with the NVMe/TCP model this binding
-   already follows.
+1. **Source-IP allow-list** (not yet built). When the control plane exposes a volume to a client, it tells the
+   replica which client IP(s) may connect. The listener drops any connection whose source address is not on
+   that volume's allow-list, at accept, before spending a handshake. Coarse and spoofable on its own, so it
+   narrows exposure rather than authenticates.
+2. **CHAP.** Each replica mints its own credential (a username + random secret) when the control plane
+   exposes the volume to a client, and the control plane delivers it to the client, so the client holds one
+   credential per member. In the AUTH phase (`wire.md`, *Authentication*) each side proves it holds the
+   secret with an HMAC over both ends' nonces; the secret is never sent. It is **mutual**: the client
+   verifies the replica's proof, so an endpoint that does not hold the secret -- a rogue one at the
+   advertised address, or a different replica behind a reassigned endpoint -- cannot complete AUTH.
 
-Auth failure drops the connection (no CRAFT status; auth is pre-CRAFT). Only an authenticated connection
-reaches BINDING; the CHAP exchange rides transport PDUs, not CRAFT messages, so `wire.md`'s op catalog is
-unchanged.
+Without TLS nothing binds AUTH to the connection: an attacker on the path that can also reach the real replica
+can relay the exchange and then take over the authenticated connection. AUTH proves the secret holder is on
+the path, not that nothing sits between; that needs TLS (*Deferred*). The same attacker can forge a refusal, and
+because refusals are final for the credential, that replica stays unusable until the client gets new attach info.
+
+AUTH rides ordinary CRAFT framing as its own op range, the way NVMe-oF in-band authentication rides ordinary
+command capsules: one framing and one parser, and a status byte that tells the client why it was refused.
+A failure closes the connection. Only an authenticated connection reaches BINDING.
+
+The scheme is plain HMAC-SHA-256 CHAP, not NVMe-oF's DH-HMAC-CHAP. DH protects a guessable secret against
+offline attack, and these secrets are 256-bit random; its forward secrecy protects nothing without
+encryption. DH-HMAC-CHAP remains available as a later `AUTH_START.version` if either assumption changes.
+
+**Rotation.** Re-exposing a volume to a different client mints a new credential and closes every connection
+the replica holds for that volume -- bound, or still in AUTH. A replica associates a connection with its
+volume as soon as `AUTH_START` arrives, before verifying it, so no connection can slip between accept and
+bind and survive a handover. Re-exposing to the same client keeps the credential and closes nothing. An
+explicit unexpose or logout drops the credential. A replica restart keeps it, and the replica restores it
+before accepting CRAFT connections, so `NOT_EXPOSED` never means "not loaded yet".
 
 ### Session bring-up
 
 The control plane drives attachment out of band and hands the client an **attach descriptor**:
-`{ volume UUID, endpoint host:port, CHAP identity + secret }`. The client then:
+`{ volume UUID, per member: { endpoint host:port, credential { username, secret } } }`. The client then:
 
 1. connects to the endpoint and passes the source-IP gate;
-2. runs INIT and AUTH with the descriptor's credentials;
+2. runs INIT and AUTH with that member's credential;
 3. sends `LOGIN` -- which may redirect (a follower returns `term == 0` + `leader_hint`, so the client
    reconnects to the leader and repeats 1-3); on success it holds the session `term` and the geometry;
 4. opens the remaining `(queue, replica)` connections and brings each to BOUND with `HELO` (each repeats
    1-2, then binds with the descriptor's volume UUID + the session `term`).
 
-The descriptor's fields split cleanly: the endpoint drives the connect, the credentials drive AUTH, the
-volume UUID is what `HELO` carries. None of it enters a CRAFT message body.
+The descriptor's fields split cleanly: the endpoint drives the connect, the credential drives AUTH, the
+volume UUID is what `AUTH_START`, `LOGIN`, and `HELO` carry. The secret never goes on the wire; the username
+appears only in `AUTH_START`.
 
 ## `request_id` lifetime -- the late-reply rule
 
@@ -171,11 +185,13 @@ replica-side watchdog that enforces the timeout is a deferred seam today; the cl
 | request deadline | replica slow or unreachable | per-op (write: quorum proceeds; read: failover); reset the connection if the id window exhausts |
 | no reply past a liveness bound | connection suspect | probe; reconnect if unconfirmed |
 | `STALE_TERM` on a bound connection | the session term moved past us (a takeover) | the session is gone; re-`LOGIN` (deferred) |
+| `NOT_EXPOSED` / `STALE_CREDENTIAL` in AUTH | the replica no longer holds this credential (handover, unexpose, or logout) | treat the replica as down and stop connecting with this credential (fail fast); recovery needs fresh attach info from the control plane |
+| `AUTH_FAILED`, or a bad replica proof | the secrets disagree, or the endpoint is not the replica it claims | same: treat the replica as down, never bind, stop connecting with this credential |
 
 **Reconnect** re-runs CONNECTING -> INIT -> AUTH -> BINDING(`HELO`) on a fresh socket, with a bounded backoff
 (a reconnect delay and a ceiling, the analogue of NVMe/TCP's `ctrl_loss_tmo`, after which the connection is
-abandoned). INIT and AUTH run again because the socket is new -- AUTH reuses the same attach credentials, so
-there is no control-plane round-trip -- but the **session is not re-established**: `HELO` re-binds the new
+abandoned). INIT and AUTH run again because the socket is new -- AUTH reuses the same attach credential, so
+there is no control-plane round-trip unless AUTH reports the credential gone -- but the **session is not re-established**: `HELO` re-binds the new
 socket to the still-live session (`term` persists). Because ops are idempotent, in-flight requests on the
 dead connection are retried on the reconnected one or routed to another replica; there is no per-command
 replay log.
@@ -219,6 +235,5 @@ The transport fails per-connection; CRAFT tolerates it per-replica:
 - Server-side resync (`SyncRSCommitLSN`), which makes the recovery clear-path above effective.
 - Encryption on the wire: CHAP (above) authenticates but does not encrypt. TLS 1.3 under the framing, where
   NVMe/TCP puts it, is the confidentiality upgrade -- deferred for an intra-DC v1.
-- The exact CHAP PDU encoding (challenge/response transport PDUs): follow the NVMe-oF authentication PDUs, to
-  be pinned when the binding is implemented.
+- Connection-init (version + digest negotiation) and the source-IP allow-list.
 - Multi-partition: each partition is its own session and connection set.

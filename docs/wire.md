@@ -75,6 +75,15 @@ the value alone is a direction check. The op set is far under 64, so a single by
 | `KEEPALIVE` | 9 | | `KEEPALIVE_RSP` | 10 |
 | `LOGOUT` | 11 | | `LOGOUT_RSP` | 12 |
 | `RESOLVE` | 13 | | `RESOLVE_RSP` | 14 |
+| `CREATE_VOLUME` | 15 | | `CREATE_VOLUME_RSP` | 16 |
+| `GET_RS_COMMIT_LSN` | 17 | | `GET_RS_COMMIT_LSN_RSP` | 18 |
+| `FETCH_DATA` | 19 | | `FETCH_DATA_RSP` | 20 |
+| `AUTH_START` | 21 | | `AUTH_CHALLENGE` | 22 |
+| `AUTH_PROOF` | 23 | | `AUTH_RESULT` | 24 |
+
+1-14 are the client plane. 15-20 are the peer plane (replica to replica, plus bootstrap volume creation),
+specified by `wire.hpp` and not described further here. 21-24 are the connection-phase AUTH exchange (see
+*Authentication*).
 
 `request_id` correlates a response to its request. It is a per-connection correlator allocated per request --
 not the ublk tag (a split read issues several requests against one tag) -- and is not reused on a connection
@@ -91,6 +100,8 @@ at open, and every IO on it reuses that binding. There is no per-IO or per-op ha
 latency killer -- so the only constants carried per IO are the ones that actually change (the commit
 watermarks).
 
+- **AUTH** (ops 21-24) runs first on every connection and admits it for one volume. It answers "may this
+  connection exist"; it carries no session state. See *Authentication*.
 - **`LOGIN`** establishes a new session on the leader (the full `GetRSCommitLSN` -> `SyncRSCommitLSN` ->
   `InternalLogin` orchestration) and binds the connection it arrives on. It returns the session `term`, the
   starting `dLSN`, and the volume geometry.
@@ -106,7 +117,7 @@ watermarks).
 
 `WRITE`, `READ`, `KEEPALIVE`, `LOGOUT`, and `RESOLVE` requests begin their operation header with this 16-byte
 block -- CRAFT's commit, piggybacked on the IO the client is already sending (there is no standalone commit
-verb). `LOGIN` and `HELO` omit it (pre-session).
+verb). `LOGIN`, `HELO`, and the AUTH ops omit it (pre-session).
 
 | offset | size | field | notes |
 |---|---|---|---|
@@ -299,6 +310,98 @@ Response body: `empty_count` packed `i64` dLSNs (ascending) -- the slots `<= res
 including verdicts from earlier rounds, so a client whose previous reply was lost still learns them. Every
 other formerly-unresolved slot `<= resolved_upto` was filled and is durable.
 
+## Authentication
+
+Mutual CHAP over HMAC-SHA-256, as two request/response pairs at the start of a connection, before `LOGIN` /
+`HELO`. Each end proves it holds the replica's per-attach secret; the secret itself never goes on the wire.
+Like NVMe-oF in-band authentication (Authentication Send/Receive over ordinary command capsules), it uses the
+normal message framing rather than a separate transport PDU type. Admission and the credential lifecycle are
+in `transport.md`.
+
+```
+client                                     replica
+  AUTH_START     {volume_id, username, Mc}  ->
+                                            <-  AUTH_CHALLENGE  {Ms}         status != OK: closes
+  AUTH_PROOF     {Rc}                       ->
+                                            <-  AUTH_RESULT     {Rs}         status != OK: closes
+```
+
+### Credential
+
+A credential is `{username, password}`, provisioned per (attach, replica) by the control plane. Both are
+opaque byte strings, used exactly as provisioned (no decoding). `username` is 1-64 bytes and is not secret: it
+identifies the credential generation, so a replica holding a rotated credential rejects a stale one by name.
+`password` is the HMAC key and MUST carry at least 256 bits from a CSPRNG -- the scheme has no defense against
+offline guessing of a weaker one. With 32 random bytes delivered hex-encoded, the 64 ASCII characters
+themselves are the key, not the 32 bytes they encode.
+
+### Proofs
+
+```
+Rc = HMAC-SHA-256(password, "craft-auth-v1 client" | volume_id | u8 len(username) | username | Mc | Ms)
+Rs = HMAC-SHA-256(password, "craft-auth-v1 server" | volume_id | u8 len(username) | username | Mc | Ms)
+```
+
+The labels are 20 ASCII bytes, no terminator. The role label stops a proof being reflected back as the
+other side's; covering both nonces stops a proof being replayed on another connection. `Mc` and `Ms` are 32
+bytes each from a CSPRNG, fresh per connection. Proofs are compared in constant time. `craft/auth.hpp`
+implements both proofs; client and server MUST hash through it so they hash identical bytes.
+
+### AUTH_START (request op = 21, response op = 22 AUTH_CHALLENGE)
+
+Request operation header (56 bytes):
+
+| offset | size | field | notes |
+|---|---|---|---|
+| 0 | 2 | `version` (u16) | auth scheme version; 1 = the HMAC-SHA-256 exchange above |
+| 2 | 2 | reserved (0) | |
+| 4 | 4 | reserved (0) | |
+| 8 | 16 | `volume_id` (uuid) | which volume's credential to check; the same id `LOGIN` / `HELO` must present |
+| 24 | 32 | `client_nonce` (u8[32]) | `Mc` |
+
+Request body: `username`, 1-64 bytes.
+
+Response (`AUTH_CHALLENGE`) operation header (32 bytes):
+
+| offset | size | field | notes |
+|---|---|---|---|
+| 0 | 32 | `server_nonce` (u8[32]) | `Ms`; zero-filled on a non-OK status |
+
+No response body. Status: `OK`, `NOT_EXPOSED` (no credential for `volume_id` here), `STALE_CREDENTIAL`
+(`username` is not the current credential), or `INVALID_ARGUMENT` (unsupported `version`, or `username`
+length out of range).
+
+### AUTH_PROOF (request op = 23, response op = 24 AUTH_RESULT)
+
+Request operation header (32 bytes): `client_proof` (u8[32]) = `Rc`. No body.
+
+Response (`AUTH_RESULT`) operation header (32 bytes): `server_proof` (u8[32]) = `Rs`, zero-filled on a non-OK
+status. No body. Status: `OK` or `AUTH_FAILED` (`Rc` did not verify).
+
+### Rules
+
+- **Order.** A replica that enforces auth accepts only `AUTH_START` as a connection's first message, then only
+  `AUTH_PROOF`. Any other op before success, or any AUTH op after it, closes the connection without a reply.
+- **One attempt.** A non-OK `AUTH_CHALLENGE` / `AUTH_RESULT` is sent and the replica closes. There is no retry
+  on the same connection.
+- **Mutual, fail-closed.** A client given a credential completes the exchange and verifies `Rs` before sending
+  `LOGIN` / `HELO`, on every connection including reconnects. A missing or wrong `Rs`, or any non-OK status,
+  fails the connection; the client never falls back to an unauthenticated connection. A client with no
+  credential skips AUTH; only a replica that does not enforce auth (the reference server, tests) admits it.
+- **Volume binding.** `LOGIN` / `HELO` on an authenticated connection must name the authenticated
+  `volume_id`; a mismatch is `INVALID_ARGUMENT`.
+- **Refusals are final for the credential.** `NOT_EXPOSED`, `STALE_CREDENTIAL`, `AUTH_FAILED`, or a bad `Rs`
+  mean the credential cannot succeed against this replica again: a client stops connecting with it and fails
+  fast until it is given new attach info. To keep `NOT_EXPOSED` meaning "not exposed", a replica MUST restore
+  its exposed credentials before it accepts CRAFT connections. Any other non-OK AUTH status (e.g. `INTERNAL`)
+  fails only that attempt.
+- **AUTH statuses on AUTH replies only.** Statuses 8-10 are valid only on `AUTH_CHALLENGE` / `AUTH_RESULT`; a
+  client treats one on any other reply as a protocol violation and classifies the op like a lost reply (it may
+  have applied).
+- **Stalls.** The replica's accept-to-bound deadline covers a stalled exchange; AUTH adds no timer of its own.
+- **Stable layout.** The AUTH op layouts do not change with the wire `version`, so they can run independently
+  of connection-init. A new scheme is a new `AUTH_START.version`, not a new layout.
+
 ## Status codes
 
 Carried in the message header `status` byte on responses. Values 1-6 are exactly `craft_error`
@@ -314,6 +417,9 @@ Carried in the message header `status` byte on responses. Values 1-6 are exactly
 | 5 | NOT_ELIGIBLE | replica cannot serve this read (Missing overlap / below login dLSN) |
 | 6 | REPLICA_DOWN | addressed replica is down / unreachable |
 | 7 | INVALID_ARGUMENT | misaligned addr/len, or `body_len` over `max_tx` |
+| 8 | NOT_EXPOSED | AUTH: the volume is not exposed on this replica; get fresh attach info from the control plane |
+| 9 | STALE_CREDENTIAL | AUTH: the credential was rotated; get fresh attach info from the control plane |
+| 10 | AUTH_FAILED | AUTH: the client's proof did not verify |
 | 255 | INTERNAL | unexpected server-side failure |
 
 ## The TCP binding
@@ -324,7 +430,9 @@ Before any CRAFT message, the two ends exchange a transport init (the analogue o
 the client offers its maximum wire `version` and its digest capabilities; the replica replies with the
 `version` to use and which digests are enabled. Because the client is always **>= the replica** in version,
 the chosen version is the replica's, and the client speaks its backward-compatible codec for that version.
-Digest negotiation is per-connection and fixed for its lifetime.
+Digest negotiation is per-connection and fixed for its lifetime. Connection-init precedes AUTH.
+
+Not implemented yet: there is no init exchange today, and both ends run wire version 1 with both digests off.
 
 ### Framing
 
@@ -338,7 +446,7 @@ framing is free.
 
 CRC32C (Castagnoli -- the SSE4.2 `crc32` instruction), matching iSCSI and NVMe/TCP practice:
 
-- **Header digest (HDGST)**, default on: a `u32` over the message header plus the operation header, placed
+- **Header digest (HDGST)**, negotiated, to default on once connection-init exists: a `u32` over the message header plus the operation header, placed
   immediately **after** the operation header and **before** the body -- so a corrupt header is rejected
   before the receiver commits to reading (or allocating for) the payload.
 - **Data digest (DDGST)**, negotiated: a `u32` over the body, placed after it. Enable it for wire-to-disk
@@ -380,9 +488,10 @@ application-level fragmentation or reassembly.
 
 ## Not covered yet
 
-- **Peer / internal ops** (`SyncRSCommitLSN`, `fetch_data`, the RAFT-entry API): server-to-server, not part
-  of the client wire. They get their own op range when the resync path is built.
-- **Authentication / encryption**: out of scope for an intra-DC v1. If needed it is a transport-binding
-  concern (TLS under the TCP framing), not a change to the CRAFT message.
+- **Peer-plane op layouts** (15-20): allocated and defined in `wire.hpp`, not yet described here. Peer-plane
+  connections are not authenticated yet; a replica serving them on its CRAFT port must not apply the AUTH
+  ordering rule to them until they have a credential model.
+- **Encryption**: out of scope for an intra-DC v1. If needed it is TLS under the TCP framing, below and
+  independent of the AUTH exchange.
 - **Multi-partition**: each partition is its own client with its own session and connections; this document
   describes a single partition's wire.
