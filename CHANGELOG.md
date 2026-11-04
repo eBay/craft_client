@@ -16,17 +16,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   replica -- the blocking admin connection and each on-ring data connection, including reconnects -- completes
   AUTH and verifies the replica's proof before LOGIN / HELO, and never falls back to an unauthenticated one.
   Unset means no AUTH, which only a non-enforcing replica (the reference server) admits.
-- A refusal (`NOT_EXPOSED` / `STALE_CREDENTIAL` / `AUTH_FAILED`, or a bad replica proof) is final for the
-  credential: that connection stops reconnecting and fails fast until the cluster is rebuilt with new attach info.
-  Any other non-OK AUTH status fails only that attempt. An unusable local credential (empty, or a username over 64
-  bytes) fails the same way without connecting.
-- A connect-phase failure on the on-ring path (connect, AUTH, or HELO, including a HELO the replica rejects) is now
-  reported as `REPLICA_DOWN` rather than `timed_out`: the op was never sent, so it counts toward a write's
-  provably-Empty verdict and a read fails over past it.
+- A refusal (`NOT_EXPOSED` / `STALE_CREDENTIAL` / `AUTH_FAILED`, `INVALID_ARGUMENT` -- reported as `AUTH_FAILED` --
+  or a bad replica proof) is final for the credential: every connection to that replica stops reconnecting and
+  fails fast until the cluster is rebuilt with new attach info, and `login` returns the refusal as soon as the
+  refusing members leave no quorum. Any other non-OK AUTH status fails only that attempt. An unusable local
+  credential (empty, or a username over 64 bytes) fails the same way without connecting.
+- A connect-phase failure on the on-ring path (connect, AUTH, or a failed HELO exchange) is now reported as
+  `REPLICA_DOWN` rather than `timed_out`: the op was never sent, so it counts toward a write's provably-Empty
+  verdict and a read fails over past it. A HELO the replica rejects keeps its status (e.g. `STALE_TERM`), as on the
+  blocking path.
 - `status_to_error` maps statuses 8-10 on a non-AUTH reply to `timed_out` (a protocol violation, classified like a
-  lost reply), and `to_wire_status` never produces them.
-- `craft_error::NOT_EXPOSED`, `STALE_CREDENTIAL`, `AUTH_FAILED`. The client treats them as never-delivered:
-  they count toward a write's provably-Empty verdict and a read fails over past them.
+  lost reply). `to_wire_status` maps the AUTH errors to them; a server sends them only on AUTH replies.
+- `craft_error::NOT_EXPOSED`, `STALE_CREDENTIAL`, `AUTH_FAILED`. A read fails over past them. Like `STALE_TERM`,
+  they never count toward a write's provably-Empty verdict: the volume may have been handed to a successor that
+  holds the slot.
 
 ### Changed
 - OpenSSL 3 is now a dependency.

@@ -60,3 +60,12 @@ TEST(CraftTypes, AuthStatusOnNonAuthReplyIsNotDeterministic) {
     for (auto const s : {status::not_exposed, status::stale_credential, status::auth_failed})
         EXPECT_EQ(craft::status_to_error(s), std::make_error_condition(std::errc::timed_out)) << static_cast< int >(s);
 }
+
+TEST(CraftTypes, AuthRefusalsMapToTheirWireStatus) {
+    using craft::craft_error;
+    using craft::wire::status;
+    EXPECT_EQ(craft::to_wire_status(craft::make_error_condition(craft_error::NOT_EXPOSED)), status::not_exposed);
+    EXPECT_EQ(craft::to_wire_status(craft::make_error_condition(craft_error::STALE_CREDENTIAL)),
+              status::stale_credential);
+    EXPECT_EQ(craft::to_wire_status(craft::make_error_condition(craft_error::AUTH_FAILED)), status::auth_failed);
+}

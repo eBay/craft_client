@@ -921,9 +921,9 @@ GatedCluster make_gated_cluster(uint32_t n) {
 
 } // namespace
 
-// An AUTH reject means the write never reached that replica. When every replica rejects, nobody holds the slot:
-// it resolves Empty and the frontier passes it, exactly as for REPLICA_DOWN.
-TEST(CraftClient, AllReplicasAuthRejectResolvesEmpty) {
+// An AUTH refusal means the write never reached that replica, but the volume may have been handed to a successor
+// that holds the slot. Like STALE_TERM, an all-refused write never resolves Empty: the frontier stays pinned.
+TEST(CraftClient, AllReplicasAuthRejectPinsFrontier) {
     auto cl = make_gated_cluster(3);
     auto buf = page_of(1);
     ASSERT_TRUE(wr(*cl.client, 1, buf));
@@ -933,9 +933,41 @@ TEST(CraftClient, AllReplicasAuthRejectResolvesEmpty) {
         g->reject = craft::craft_error::STALE_CREDENTIAL;
     EXPECT_FALSE(wr(*cl.client, 2, buf));
     // Checked while the rejects still stand, so no later resolution round can be what Emptied the slot.
-    EXPECT_EQ(cl.client->commit_lsn(), 1) << "dLSN 1 is Empty: no replica was ever sent it";
+    EXPECT_EQ(cl.client->commit_lsn(), 0) << "dLSN 1 must stay unresolved, not Empty";
     for (auto& g : cl.gates)
         g->reject.reset();
+}
+
+// Login admits through the leader, but if the members that refuse the credential leave no quorum, it fails at once
+// with the refusal (the caller needs fresh attach info), not NO_QUORUM after the admit deadline.
+TEST(CraftClient, LoginFailsFastWhenAuthRejectsBreakQuorum) {
+    auto set = craft::make_mem_replica_group(boost::uuids::random_generator()(), 3, PAGE);
+    std::vector< std::shared_ptr< auth_gated_replica > > gates;
+    std::vector< std::shared_ptr< craft::craft_replica > > backends;
+    for (auto const& r : set.replicas) {
+        gates.push_back(std::make_shared< auth_gated_replica >(r));
+        backends.push_back(gates.back());
+    }
+    gates[1]->reject = craft::craft_error::STALE_CREDENTIAL;
+    gates[2]->reject = craft::craft_error::STALE_CREDENTIAL;
+    craft::craft_client client{std::move(backends), 0};
+
+    auto const t0 = std::chrono::steady_clock::now();
+    auto const r = rg(client.login(TOKEN));
+    ASSERT_FALSE(r.has_value());
+    EXPECT_EQ(r.error(), make_error_condition(craft::craft_error::STALE_CREDENTIAL));
+    EXPECT_LT(std::chrono::steady_clock::now() - t0, std::chrono::seconds{1}) << "must not wait out the admit deadline";
+}
+
+// One refusing member still leaves a quorum, so login admits.
+TEST(CraftClient, LoginAdmitsPastASingleAuthReject) {
+    auto set = craft::make_mem_replica_group(boost::uuids::random_generator()(), 3, PAGE);
+    std::vector< std::shared_ptr< craft::craft_replica > > backends;
+    for (auto const& r : set.replicas)
+        backends.push_back(std::make_shared< auth_gated_replica >(r));
+    std::static_pointer_cast< auth_gated_replica >(backends[2])->reject = craft::craft_error::NOT_EXPOSED;
+    craft::craft_client client{std::move(backends), 0};
+    EXPECT_TRUE(rg(client.login(TOKEN)).has_value());
 }
 
 // A read fails over past replicas that reject AUTH, from every rotating start.

@@ -57,9 +57,7 @@ std::expected< void, net_error > wire_client::authenticate(std::array< uint8_t, 
     if (!conn_.send_all(out)) return std::unexpected(net_error::send);
     auto msg = conn_.recv_message(k_max_tx, timeout);
     if (!msg) return std::unexpected(msg.error());
-    auto parsed = wire::parse_message(*msg, k_max_tx);
-    if (!parsed) return std::unexpected(net_error::malformed);
-    auto const proof = ac->on_challenge(*parsed);
+    auto const proof = ac->on_challenge(*msg, k_max_tx);
     if (!proof) return std::unexpected(proof.error());
 
     out.clear();
@@ -67,9 +65,7 @@ std::expected< void, net_error > wire_client::authenticate(std::array< uint8_t, 
     if (!conn_.send_all(out)) return std::unexpected(net_error::send);
     msg = conn_.recv_message(k_max_tx, timeout);
     if (!msg) return std::unexpected(msg.error());
-    parsed = wire::parse_message(*msg, k_max_tx);
-    if (!parsed) return std::unexpected(net_error::malformed);
-    return ac->on_result(*parsed);
+    return ac->on_result(*msg, k_max_tx);
 }
 
 std::expected< login_result, net_error > wire_client::login(std::array< uint8_t, 16 > const& volume_id,

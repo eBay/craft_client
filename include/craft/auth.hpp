@@ -20,6 +20,7 @@
 #include <array>
 #include <cstdint>
 #include <optional>
+#include <string>
 #include <string_view>
 
 namespace craft::auth {
@@ -42,5 +43,8 @@ std::optional< nonce > make_nonce() noexcept;
 
 /// Constant-time comparison.
 bool proofs_equal(proof const& a, proof const& b) noexcept;
+
+/// Overwrite `secret`'s bytes in a way the compiler cannot elide.
+void cleanse(std::string& secret) noexcept;
 
 } // namespace craft::auth

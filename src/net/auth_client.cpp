@@ -18,8 +18,8 @@
 namespace craft::net {
 
 namespace {
-// The replica's status on a non-ok AUTH reply; it closes the connection right after. Only 8-10 refuse the
-// credential; any other status (e.g. INTERNAL) fails this attempt without making the refusal sticky.
+// The replica's status on a non-ok AUTH reply; it closes the connection right after. 8-10 and INVALID_ARGUMENT refuse
+// the credential; any other status (e.g. INTERNAL) fails this attempt without making the refusal sticky.
 net_error rejection(wire::status s) noexcept {
     switch (s) {
     case wire::status::not_exposed:
@@ -27,6 +27,7 @@ net_error rejection(wire::status s) noexcept {
     case wire::status::stale_credential:
         return net_error::stale_credential;
     case wire::status::auth_failed:
+    case wire::status::invalid_argument:
         return net_error::auth_failed;
     default:
         return net_error::malformed;
@@ -62,11 +63,14 @@ std::span< uint8_t const > auth_client::start_body() const noexcept {
     return {reinterpret_cast< uint8_t const* >(username_.data()), username_.size()};
 }
 
-std::expected< wire::auth_proof_req, net_error > auth_client::on_challenge(wire::message const& reply) noexcept {
-    if (reply.hdr.op != static_cast< uint8_t >(wire::op::auth_challenge)) return std::unexpected(net_error::malformed);
-    if (auto const s = static_cast< wire::status >(reply.hdr.status); s != wire::status::ok)
+std::expected< wire::auth_proof_req, net_error > auth_client::on_challenge(std::span< uint8_t const > raw,
+                                                                           uint32_t max_tx) noexcept {
+    auto const reply = wire::parse_message(raw, max_tx);
+    if (!reply || reply->hdr.op != static_cast< uint8_t >(wire::op::auth_challenge))
+        return std::unexpected(net_error::malformed);
+    if (auto const s = static_cast< wire::status >(reply->hdr.status); s != wire::status::ok)
         return std::unexpected(rejection(s));
-    server_nonce_ = wire::decode< wire::auth_challenge_rsp >(reply.op_header).server_nonce;
+    server_nonce_ = wire::decode< wire::auth_challenge_rsp >(reply->op_header).server_nonce;
 
     auto const rc =
         auth::compute_proof(password_, auth::role::client, volume_id_, username_, start_.client_nonce, server_nonce_);
@@ -74,14 +78,17 @@ std::expected< wire::auth_proof_req, net_error > auth_client::on_challenge(wire:
     return wire::auth_proof_req{*rc};
 }
 
-std::expected< void, net_error > auth_client::on_result(wire::message const& reply) const noexcept {
-    if (reply.hdr.op != static_cast< uint8_t >(wire::op::auth_result)) return std::unexpected(net_error::malformed);
-    if (auto const s = static_cast< wire::status >(reply.hdr.status); s != wire::status::ok)
+std::expected< void, net_error > auth_client::on_result(std::span< uint8_t const > raw,
+                                                        uint32_t max_tx) const noexcept {
+    auto const reply = wire::parse_message(raw, max_tx);
+    if (!reply || reply->hdr.op != static_cast< uint8_t >(wire::op::auth_result))
+        return std::unexpected(net_error::malformed);
+    if (auto const s = static_cast< wire::status >(reply->hdr.status); s != wire::status::ok)
         return std::unexpected(rejection(s));
 
     auto const expected_rs =
         auth::compute_proof(password_, auth::role::server, volume_id_, username_, start_.client_nonce, server_nonce_);
-    auto const rs = wire::decode< wire::auth_result_rsp >(reply.op_header).server_proof;
+    auto const rs = wire::decode< wire::auth_result_rsp >(reply->op_header).server_proof;
     if (!expected_rs) return std::unexpected(net_error::setup);
     if (!auth::proofs_equal(*expected_rs, rs)) return std::unexpected(net_error::auth_failed);
     return {};

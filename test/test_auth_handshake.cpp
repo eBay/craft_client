@@ -75,6 +75,7 @@ struct replica_script {
     bool exposed = true;      // false: answers NOT_EXPOSED
     bool impostor = false;    // does not hold the secret: accepts any client proof, answers with a forged one
     bool reject_helo = false; // after AUTH, answers HELO with STALE_TERM instead of serving
+    int serve_first = 0;      // with reject_helo: the first N connections are served normally
     wire::status challenge_status = wire::status::ok; // non-ok: answer AUTH_START with it
     int connections = 1;                              // connections accepted (0 = the client must never connect)
 };
@@ -156,19 +157,19 @@ private:
             auto conn = lst_.accept();
             if (!conn || stopping_) break;
             ++accepted_;
-            conns.emplace_back([this, c = std::move(*conn)]() mutable { serve(std::move(c)); });
+            conns.emplace_back([this, i, c = std::move(*conn)]() mutable { serve(std::move(c), i); });
         }
         done_ = true;
     }
 
-    void serve(net::craft_conn conn) {
+    void serve(net::craft_conn conn, int index) {
         if (rs_.enforce && !serve_auth(conn, rs_)) return;
         ++admitted_;
         if (rs_.impostor) {
             if (conn.recv_message(k_max_tx, k_timeout).has_value()) sent_after_impostor_ = true;
             return;
         }
-        if (rs_.reject_helo) {
+        if (rs_.reject_helo && index >= rs_.serve_first) {
             auto msg = conn.recv_message(k_max_tx, k_timeout);
             if (!msg) return;
             auto m = wire::parse_message(*msg, k_max_tx);
@@ -218,28 +219,29 @@ uint16_t closed_port() {
 using ready_result = std::optional< std::expected< void, net::net_error > >;
 
 // Named wrapper, not a capturing lambda: its frame must outlive the first suspension.
-async_status issue_ready(net::craft_async_conn* c, std::shared_ptr< ready_result > out) {
-    *out = co_await c->ensure_ready(k_vol, k_token, /*term=*/0);
+async_status issue_ready(net::craft_async_conn* c, std::shared_ptr< ready_result > out, uint64_t term) {
+    *out = co_await c->ensure_ready(k_vol, k_token, term);
     co_return sisl::ok();
 }
 
 // One craft_async_conn on a test-owned ring. `driver` is declared after `conn` so it exits the ring first --
 // the craft_async_conn::shutdown contract.
 struct ring_session {
+    std::optional< auth_credential > cred; // before conn, which points into it
     std::unique_ptr< net::craft_async_conn > conn;
     ring_driver driver{64};
 
-    ring_session(uint16_t port, std::optional< auth_credential > cred) {
+    ring_session(uint16_t port, std::optional< auth_credential > c) : cred{std::move(c)} {
         conn = std::make_unique< net::craft_async_conn >("127.0.0.1", port, wire::framed_body_max(k_max_tx, k_lba),
-                                                         &driver.ring, std::move(cred));
+                                                         &driver.ring, cred ? &*cred : nullptr);
     }
-    std::shared_ptr< ready_result > start() {
+    std::shared_ptr< ready_result > start(uint64_t term = 0) {
         auto out = std::make_shared< ready_result >();
-        issue_ready(conn.get(), out).detach();
+        issue_ready(conn.get(), out, term).detach();
         return out;
     }
-    std::expected< void, net::net_error > ready() {
-        auto out = start();
+    std::expected< void, net::net_error > ready(uint64_t term = 0) {
+        auto out = start(term);
         EXPECT_TRUE(driver.drive_until([&] { return out->has_value(); })) << "ensure_ready must complete";
         return out->has_value() ? **out : std::unexpected(net::net_error::timed_out);
     }
@@ -341,8 +343,25 @@ TEST(CraftAuthHandshake, RefusalIsSticky) {
     replica.join();
 }
 
-// A status outside 8-10 (here INTERNAL) is not a refusal of the credential: the second attempt reconnects.
-// Nothing was sent either way, so both are REPLICA_DOWN.
+// INVALID_ARGUMENT (e.g. an unsupported auth version) cannot succeed on a retry either, so it is final too.
+TEST(CraftAuthHandshake, InvalidArgumentRefusalIsSticky) {
+    auto rs = replica_script{};
+    rs.challenge_status = wire::status::invalid_argument;
+    scripted_replica replica{rs};
+    {
+        CraftTcpReplica proxy{"127.0.0.1", replica.port(), peer_id_t{}, k_vol, k_timeout, k_cred};
+        for (int i = 0; i < 2; ++i) {
+            auto lr = rg(proxy.login(k_token));
+            ASSERT_FALSE(lr.has_value());
+            EXPECT_EQ(lr.error(), make_error_condition(craft_error::AUTH_FAILED)) << "attempt " << i;
+        }
+    }
+    replica.join();
+    EXPECT_EQ(replica.accepted(), 1);
+}
+
+// A status outside 8-10 and INVALID_ARGUMENT (here INTERNAL) is not a refusal of the credential: the second attempt
+// reconnects. Nothing was sent either way, so both are REPLICA_DOWN.
 TEST(CraftAuthHandshake, NonRefusalStatusIsNotSticky) {
     auto rs = replica_script{};
     rs.challenge_status = wire::status::internal;
@@ -391,6 +410,52 @@ TEST(CraftAuthHandshake, ProxyRingConnectionAuthenticates) {
     }
     replica.join();
     EXPECT_EQ(replica.admitted(), 2) << "the admin connection and the ring connection both completed AUTH";
+}
+
+// A refusal on the blocking path stops the proxy's ring connections too: they fail fast without connecting.
+TEST(CraftAuthHandshake, ProxyRefusalIsSharedWithRingConnections) {
+    auto rs = replica_script{};
+    rs.cred.username = "rotated-username";
+    scripted_replica replica{rs};
+    {
+        CraftTcpReplica proxy{"127.0.0.1", replica.port(), peer_id_t{}, k_vol, k_timeout, k_cred};
+        auto lr = rg(proxy.login(k_token));
+        ASSERT_FALSE(lr.has_value());
+        ASSERT_EQ(lr.error(), make_error_condition(craft_error::STALE_CREDENTIAL));
+
+        ring_driver driver{64};
+        auto out = std::make_shared< std::optional< result< lsn_pair > > >();
+        issue_keep_alive(&proxy, &driver.ring, chdr(1), out).detach();
+        ASSERT_TRUE(driver.drive_until([&] { return out->has_value(); }));
+        ASSERT_FALSE(out->value().has_value());
+        EXPECT_EQ(out->value().error(), make_error_condition(craft_error::STALE_CREDENTIAL));
+    }
+    replica.join();
+    EXPECT_EQ(replica.accepted(), 1) << "the ring connection must not reconnect with a refused credential";
+}
+
+// A HELO the replica fences on the proxy's ring connection surfaces as STALE_TERM, never REPLICA_DOWN: the client
+// must not count it toward a write's Empty verdict (a successor may hold the slot).
+TEST(CraftAuthHandshake, ProxyRingHeloRejectionIsStaleTerm) {
+    auto rs = replica_script{};
+    rs.connections = 2;
+    rs.reject_helo = true;
+    rs.serve_first = 1; // the admin LOGIN connection is served
+    scripted_replica replica{rs};
+    {
+        CraftTcpReplica proxy{"127.0.0.1", replica.port(), peer_id_t{}, k_vol, k_timeout, k_cred};
+        auto lr = rg(proxy.login(k_token));
+        ASSERT_TRUE(lr.has_value()) << lr.error().message();
+
+        ring_driver driver{64};
+        auto out = std::make_shared< std::optional< result< lsn_pair > > >();
+        issue_keep_alive(&proxy, &driver.ring, chdr(lr->term), out).detach();
+        ASSERT_TRUE(driver.drive_until([&] { return out->has_value(); }));
+        ASSERT_FALSE(out->value().has_value());
+        EXPECT_EQ(out->value().error(), make_error_condition(craft_error::STALE_TERM))
+            << out->value().error().message();
+    }
+    replica.join();
 }
 
 // The public builder carries replica_endpoint::credential to the proxy.
@@ -488,10 +553,23 @@ TEST(CraftAuthHandshake, OnRingRetryAfterHandshakeFailure) {
     scripted_replica replica{rs};
     {
         ring_session ring{replica.port(), k_cred};
-        EXPECT_EQ(ring.ready().error(), net::net_error::closed);
-        EXPECT_EQ(ring.ready().error(), net::net_error::connect) << "old pump still in flight: no reconnect yet";
+        auto first = ring.start();
+        auto parked = ring.start();
+        ASSERT_TRUE(ring.driver.drive_until([&] { return first->has_value() && parked->has_value(); }));
+        EXPECT_EQ(first->value().error(), net::net_error::helo_rejected);
+        EXPECT_EQ(parked->value().error(), net::net_error::helo_rejected) << "a parked op keeps the HELO status";
+        EXPECT_EQ(ring.conn->helo_rejection(), wire::status::stale_term);
+
+        // Both start before any reap, so both see the old pump still in flight and neither reconnects.
+        auto same_term = ring.start();
+        auto other_term = ring.start(/*term=*/1);
+        ASSERT_TRUE(ring.driver.drive_until([&] { return same_term->has_value() && other_term->has_value(); }));
+        EXPECT_EQ(same_term->value().error(), net::net_error::helo_rejected) << "the fencing status is kept";
+        EXPECT_EQ(other_term->value().error(), net::net_error::connect) << "it was given for term 0, not term 1";
+
         ring.driver.drain_for(std::chrono::milliseconds{100});
-        EXPECT_EQ(ring.ready().error(), net::net_error::closed) << "reconnected, re-authenticated, HELO refused again";
+        EXPECT_EQ(ring.ready().error(), net::net_error::helo_rejected)
+            << "reconnected, re-authenticated, HELO refused again";
     }
     replica.join();
 }

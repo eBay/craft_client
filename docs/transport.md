@@ -185,8 +185,8 @@ replica-side watchdog that enforces the timeout is a deferred seam today; the cl
 | request deadline | replica slow or unreachable | per-op (write: quorum proceeds; read: failover); reset the connection if the id window exhausts |
 | no reply past a liveness bound | connection suspect | probe; reconnect if unconfirmed |
 | `STALE_TERM` on a bound connection | the session term moved past us (a takeover) | the session is gone; re-`LOGIN` (deferred) |
-| `NOT_EXPOSED` / `STALE_CREDENTIAL` in AUTH | the replica no longer holds this credential (handover, unexpose, or logout) | treat the replica as down and stop connecting with this credential (fail fast); recovery needs fresh attach info from the control plane |
-| `AUTH_FAILED`, or a bad replica proof | the secrets disagree, or the endpoint is not the replica it claims | same: treat the replica as down, never bind, stop connecting with this credential |
+| `NOT_EXPOSED` / `STALE_CREDENTIAL` in AUTH | the replica no longer holds this credential (handover, unexpose, or logout) | treat the replica as down and stop connecting with this credential (fail fast); a write never counts it toward Empty (a successor may hold the slot); recovery needs fresh attach info from the control plane |
+| `AUTH_FAILED`, `INVALID_ARGUMENT` in AUTH, or a bad replica proof | the secrets disagree, the replica cannot accept this auth `version` / `username`, or the endpoint is not the replica it claims | same: treat the replica as down, never bind, stop connecting with this credential |
 
 **Reconnect** re-runs CONNECTING -> INIT -> AUTH -> BINDING(`HELO`) on a fresh socket, with a bounded backoff
 (a reconnect delay and a ceiling, the analogue of NVMe/TCP's `ctrl_loss_tmo`, after which the connection is

@@ -45,6 +45,7 @@ enum class net_error {
     not_exposed,      // AUTH: the replica holds no credential for the volume
     stale_credential, // AUTH: the replica's credential was rotated
     auth_failed,      // AUTH: refused, or the replica's proof did not verify
+    helo_rejected,    // HELO answered non-OK (craft_async_conn::helo_rejection() holds the status)
 };
 
 // The default connect deadline. connect() is ALWAYS bounded: a refusing peer errors instantly (RST), so a

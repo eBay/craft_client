@@ -15,8 +15,8 @@
 
 #include <craft/auth.hpp>
 
+#include <cstring>
 #include <string_view>
-#include <vector>
 
 #include <openssl/crypto.h>
 #include <openssl/evp.h>
@@ -39,19 +39,23 @@ std::optional< proof > compute_proof(std::string_view password, role r, std::arr
     if (password.empty() || username.empty() || username.size() > wire::k_auth_max_username) return std::nullopt;
     auto const label = (r == role::client) ? k_client_label : k_server_label;
 
-    std::vector< uint8_t > msg;
-    msg.reserve(label.size() + volume_id.size() + 1 + username.size() + client_nonce.size() + server_nonce.size());
-    msg.insert(msg.end(), label.begin(), label.end());
-    msg.insert(msg.end(), volume_id.begin(), volume_id.end());
-    msg.push_back(static_cast< uint8_t >(username.size()));
-    msg.insert(msg.end(), username.begin(), username.end());
-    msg.insert(msg.end(), client_nonce.begin(), client_nonce.end());
-    msg.insert(msg.end(), server_nonce.begin(), server_nonce.end());
+    std::array< uint8_t, k_client_label.size() + 16 + 1 + wire::k_auth_max_username + 2 * sizeof(nonce) > msg;
+    std::size_t n = 0;
+    auto const put = [&](auto const& bytes) {
+        std::memcpy(msg.data() + n, bytes.data(), bytes.size());
+        n += bytes.size();
+    };
+    put(label);
+    put(volume_id);
+    msg[n++] = static_cast< uint8_t >(username.size());
+    put(username);
+    put(client_nonce);
+    put(server_nonce);
 
     proof out{};
     unsigned int len = 0;
-    auto const* const md = ::HMAC(::EVP_sha256(), password.data(), static_cast< int >(password.size()), msg.data(),
-                                  msg.size(), out.data(), &len);
+    auto const* const md =
+        ::HMAC(::EVP_sha256(), password.data(), static_cast< int >(password.size()), msg.data(), n, out.data(), &len);
     if (nullptr == md || len != out.size()) return std::nullopt;
     return out;
 }
@@ -65,5 +69,7 @@ std::optional< nonce > make_nonce() noexcept {
 bool proofs_equal(proof const& a, proof const& b) noexcept {
     return ::CRYPTO_memcmp(a.data(), b.data(), a.size()) == 0;
 }
+
+void cleanse(std::string& secret) noexcept { ::OPENSSL_cleanse(secret.data(), secret.size()); }
 
 } // namespace craft::auth

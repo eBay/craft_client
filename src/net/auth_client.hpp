@@ -22,7 +22,6 @@
 #include <cstdint>
 #include <expected>
 #include <span>
-#include <string>
 #include <string_view>
 
 #include <craft/auth.hpp>
@@ -42,7 +41,7 @@ public:
     /// A credential the exchange can use (docs/wire.md "Credential"); checked before connecting.
     static bool usable(std::string_view username, std::string_view password) noexcept;
 
-    /// Draw the client nonce and build AUTH_START.
+    /// Draw the client nonce and build AUTH_START. Keeps views of `username` and `password`, which must outlive it.
     /// @return auth_failed for an unusable username, setup if the CSPRNG fails.
     static std::expected< auth_client, net_error > begin(std::array< uint8_t, 16 > const& volume_id,
                                                          std::string_view username, std::string_view password);
@@ -50,18 +49,19 @@ public:
     std::span< uint8_t const > start_header() const noexcept;
     std::span< uint8_t const > start_body() const noexcept;
 
-    /// Check the AUTH_CHALLENGE reply and build the AUTH_PROOF request from it.
-    std::expected< wire::auth_proof_req, net_error > on_challenge(wire::message const& reply) noexcept;
+    /// Check the raw AUTH_CHALLENGE reply and build the AUTH_PROOF request from it.
+    std::expected< wire::auth_proof_req, net_error > on_challenge(std::span< uint8_t const > reply,
+                                                                  uint32_t max_tx) noexcept;
 
-    /// Check the AUTH_RESULT reply, including the replica's proof.
-    std::expected< void, net_error > on_result(wire::message const& reply) const noexcept;
+    /// Check the raw AUTH_RESULT reply, including the replica's proof.
+    std::expected< void, net_error > on_result(std::span< uint8_t const > reply, uint32_t max_tx) const noexcept;
 
 private:
     auth_client() = default;
 
     std::array< uint8_t, 16 > volume_id_{};
-    std::string username_;
-    std::string password_;
+    std::string_view username_;
+    std::string_view password_;
     wire::auth_start_req start_{};
     auth::nonce server_nonce_{};
 };

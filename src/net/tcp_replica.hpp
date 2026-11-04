@@ -143,7 +143,12 @@ private:
     std::array< uint8_t, 16 > vol_id_;
     std::chrono::milliseconds op_timeout_{0}; // forwarded onto conn_ at connect; 0 = block forever
     std::optional< auth_credential > cred_;
-    std::optional< std::error_condition > auth_rejected_; // sticky, session-mgr thread only (see is_auth_rejection)
+    // The replica's refusal of cred_ (net_error + 1, 0 = none), shared by the blocking path and every ring
+    // connection so one refusal stops them all. Advisory: each craft_async_conn also keeps its own.
+    std::atomic< uint8_t > auth_refusal_{0};
+    void note_refusal(net::net_error e) noexcept;
+    std::optional< std::error_condition > refused() const;
+    std::error_condition ring_handshake_failed(net::craft_async_conn const& c, net::net_error e);
 
     net::wire_client conn_; // touched ONLY on the session-mgr thread (login/logout: the blocking admin path)
 

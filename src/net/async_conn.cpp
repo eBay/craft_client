@@ -41,8 +41,8 @@ constexpr std::size_t k_recv_chunk = 64 * 1024; // per-recv landing size; a mess
 } // namespace
 
 craft_async_conn::craft_async_conn(std::string host, uint16_t port, uint32_t max_tx, ::io_uring* ring,
-                                   std::optional< auth_credential > cred) :
-        host_{std::move(host)}, port_{port}, max_tx_{max_tx}, ring_{ring}, cred_{std::move(cred)} {}
+                                   auth_credential const* cred) :
+        host_{std::move(host)}, port_{port}, max_tx_{max_tx}, ring_{ring}, cred_{cred} {}
 
 craft_async_conn::~craft_async_conn() { shutdown(); }
 
@@ -248,7 +248,7 @@ craft_async_conn::ensure_ready(std::array< uint8_t, 16 > const& vol, uint64_t to
         // Another op is establishing the connection (QD>1); park until it finishes, then re-check.
         co_await connect_awaitable{this};
         if (ready_) co_return std::expected< void, net_error >{};
-        co_return std::unexpected(auth_rejected_.value_or(net_error::connect));
+        co_return std::unexpected(not_ready_reason(term));
     }
     if (cred_ && !auth_client::usable(cred_->username, cred_->password)) {
         auth_rejected_ = net_error::auth_failed;
@@ -256,8 +256,9 @@ craft_async_conn::ensure_ready(std::array< uint8_t, 16 > const& vol, uint64_t to
     }
     // A failed handshake left the old pump's recv in flight (drop_fd shut the socket, but its completion is not
     // reaped yet). Its frame can be reclaimed only once it reaches final_suspend; nothing was sent this time.
-    if (pump_ && !pump_.done()) co_return std::unexpected(net_error::connect);
+    if (pump_ && !pump_.done()) co_return std::unexpected(not_ready_reason(term));
     connecting_ = true;
+    helo_rejection_ = wire::status::ok;
 
     // Clears connecting_ and resumes every op that parked behind us, then yields `r` as our own result.
     auto finish = [this](std::expected< void, net_error > r) {
@@ -314,12 +315,21 @@ craft_async_conn::ensure_ready(std::array< uint8_t, 16 > const& vol, uint64_t to
     if (static_cast< wire::status >(parsed->hdr.status) != wire::status::ok) {
         LOGDEBUG("craft_async_conn[{}:{}] HELO rejected (status={}) at term={}, client_token={}", host_, port_,
                  static_cast< int >(parsed->hdr.status), term, token);
-        drop_fd(); // HELO rejected: treat as a connection-level fault so the client re-establishes the session
-        co_return finish(std::unexpected(net_error::closed));
+        drop_fd();
+        helo_rejection_ = static_cast< wire::status >(parsed->hdr.status);
+        helo_rejected_term_ = term;
+        co_return finish(std::unexpected(net_error::helo_rejected));
     }
     ready_ = true;
     LOGTRACE("craft_async_conn[{}:{}] ready (HELO'd at term={}, client_token=)", host_, port_, term, token);
     co_return finish(std::expected< void, net_error >{});
+}
+
+net_error craft_async_conn::not_ready_reason(uint64_t term) const noexcept {
+    if (auth_rejected_) return *auth_rejected_;
+    // A fencing status stays with the term it was given for; nothing was sent, so it is safe to repeat.
+    if (helo_rejection_ != wire::status::ok && helo_rejected_term_ == term) return net_error::helo_rejected;
+    return net_error::connect;
 }
 
 sisl::async::light_task< std::expected< void, net_error > >
@@ -329,16 +339,12 @@ craft_async_conn::authenticate(std::array< uint8_t, 16 > const& vol) {
 
     auto reply = co_await round_trip(wire::op::auth_start, ac->start_header(), ac->start_body());
     if (!reply) co_return std::unexpected(reply.error());
-    auto parsed = wire::parse_message(*reply, max_tx_);
-    if (!parsed) co_return std::unexpected(net_error::malformed);
-    auto const proof = ac->on_challenge(*parsed);
+    auto const proof = ac->on_challenge(*reply, max_tx_);
     if (!proof) co_return std::unexpected(proof.error());
 
     reply = co_await round_trip(wire::op::auth_proof, as_bytes(*proof), {});
     if (!reply) co_return std::unexpected(reply.error());
-    parsed = wire::parse_message(*reply, max_tx_);
-    if (!parsed) co_return std::unexpected(net_error::malformed);
-    co_return ac->on_result(*parsed);
+    co_return ac->on_result(*reply, max_tx_);
 }
 
 // ── IO ops ──

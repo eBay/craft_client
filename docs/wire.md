@@ -390,9 +390,10 @@ status. No body. Status: `OK` or `AUTH_FAILED` (`Rc` did not verify).
   credential skips AUTH; only a replica that does not enforce auth (the reference server, tests) admits it.
 - **Volume binding.** `LOGIN` / `HELO` on an authenticated connection must name the authenticated
   `volume_id`; a mismatch is `INVALID_ARGUMENT`.
-- **Refusals are final for the credential.** `NOT_EXPOSED`, `STALE_CREDENTIAL`, `AUTH_FAILED`, or a bad `Rs`
-  mean the credential cannot succeed against this replica again: a client stops connecting with it and fails
-  fast until it is given new attach info. To keep `NOT_EXPOSED` meaning "not exposed", a replica MUST restore
+- **Refusals are final for the credential.** `NOT_EXPOSED`, `STALE_CREDENTIAL`, `AUTH_FAILED`, `INVALID_ARGUMENT`,
+  or a bad `Rs` mean the credential cannot succeed against this replica again: a client stops connecting with it
+  and fails fast until it is given new attach info. The client reports `INVALID_ARGUMENT` (the replica cannot
+  accept this `version` or `username`) as `AUTH_FAILED`. To keep `NOT_EXPOSED` meaning "not exposed", a replica MUST restore
   its exposed credentials before it accepts CRAFT connections. Any other non-OK AUTH status (e.g. `INTERNAL`)
   fails only that attempt.
 - **AUTH statuses on AUTH replies only.** Statuses 8-10 are valid only on `AUTH_CHALLENGE` / `AUTH_RESULT`; a
