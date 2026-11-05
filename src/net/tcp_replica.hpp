@@ -148,7 +148,9 @@ private:
     std::atomic< uint8_t > auth_refusal_{0};
     void note_refusal(net::net_error e) noexcept;
     std::optional< std::error_condition > refused() const;
-    std::error_condition ring_handshake_failed(net::craft_async_conn const& c, net::net_error e);
+    // Connect + AUTH + HELO `c` at hdr.term. nullopt = bound; else the error an op on it returns.
+    sisl::async::light_task< std::optional< std::error_condition > > bind_ring(net::craft_async_conn& c,
+                                                                               client_hdr hdr);
 
     net::wire_client conn_; // touched ONLY on the session-mgr thread (login/logout: the blocking admin path)
 

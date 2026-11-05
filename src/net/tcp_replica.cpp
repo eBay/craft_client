@@ -99,7 +99,9 @@ CraftTcpReplica::CraftTcpReplica(std::string host, uint16_t port, peer_id_t id, 
         vol_id_{vol},
         op_timeout_{op_timeout},
         cred_{std::move(credential)},
-        mgr_{net::craft_session_mgr::get()} {}
+        mgr_{net::craft_session_mgr::get()} {
+    if (cred_ && !net::auth_client::usable(cred_->username, cred_->password)) note_refusal(net::net_error::auth_failed);
+}
 
 net::craft_async_conn* CraftTcpReplica::conn_for(::io_uring* q) {
     if (nullptr == q) return nullptr;
@@ -211,18 +213,18 @@ std::optional< std::error_condition > CraftTcpReplica::refused() const {
     return net_to_error(static_cast< net::net_error >(v - 1));
 }
 
-std::error_condition CraftTcpReplica::ring_handshake_failed(net::craft_async_conn const& c, net::net_error e) {
-    note_refusal(e);
-    return handshake_error(c, e);
+sisl::async::light_task< std::optional< std::error_condition > > CraftTcpReplica::bind_ring(net::craft_async_conn& c,
+                                                                                            client_hdr hdr) {
+    if (auto r = refused()) co_return r;
+    auto e = co_await c.ensure_ready(vol_id_, hdr.client_token, hdr.term);
+    if (e) co_return std::nullopt;
+    note_refusal(e.error());
+    co_return handshake_error(c, e.error());
 }
 
 std::optional< std::error_condition > CraftTcpReplica::ensure_connected() {
     if (connected_) return std::nullopt;
     if (auto r = refused()) return r;
-    if (cred_ && !net::auth_client::usable(cred_->username, cred_->password)) {
-        note_refusal(net::net_error::auth_failed);
-        return make_error_condition(craft_error::AUTH_FAILED);
-    }
     // The handshake deadline: op_timeout_ when set (it bounds a full round-trip, so certainly a SYN), else the
     // default -- never unbounded, since this runs on the shared session-mgr thread where a blackholed peer
     // would stall every proxy's admin plane, not just this one's.
@@ -344,9 +346,9 @@ async_result< lsn_pair > CraftTcpReplica::write(::io_uring* q, client_hdr hdr, i
     }
     // ── on-ring data path: this queue's conn, lazily HELO'd at hdr.term, sends over the caller's ring ──
     if (auto* conn = conn_for(q)) {
-        if (auto r = refused()) co_return std::unexpected(*r);
-        if (auto e = co_await conn->ensure_ready(vol_id_, hdr.client_token, hdr.term); !e)
-            co_return std::unexpected(ring_handshake_failed(*conn, e.error()));
+        if (!conn->ready()) {
+            if (auto e = co_await bind_ring(*conn, hdr)) co_return std::unexpected(*e);
+        }
         auto const t0 = std::chrono::steady_clock::now();
         auto r = co_await conn->write(dlsn, addr, len, payload, hdr.commit_lsn, hdr.all_committed_lsn);
         rt_write_.add(ns_since(t0));
@@ -380,9 +382,9 @@ async_result< read_result > CraftTcpReplica::read(::io_uring* q, client_hdr hdr,
 
     net::read_reply reply;
     if (auto* conn = conn_for(q)) { // ── on-ring data path ──
-        if (auto r = refused()) co_return std::unexpected(*r);
-        if (auto e = co_await conn->ensure_ready(vol_id_, hdr.client_token, hdr.term); !e)
-            co_return std::unexpected(ring_handshake_failed(*conn, e.error()));
+        if (!conn->ready()) {
+            if (auto e = co_await bind_ring(*conn, hdr)) co_return std::unexpected(*e);
+        }
         auto const t0 = std::chrono::steady_clock::now();
         auto r = co_await conn->read(read_lsn, addr, len, d, hdr.commit_lsn, hdr.all_committed_lsn);
         rt_read_.add(ns_since(t0));
@@ -415,9 +417,9 @@ async_result< lsn_pair > CraftTcpReplica::keep_alive(::io_uring* q, client_hdr h
         LOGDEBUG("[PEER_ID: {}] sending ensure ready, vol id {}, client token {}, term {}",
                  boost::uuids::to_string(id_), fmt::format("{:02x}", fmt::join(vol_id_, "")), hdr.client_token,
                  hdr.term);
-        if (auto r = refused()) co_return std::unexpected(*r);
-        if (auto e = co_await conn->ensure_ready(vol_id_, hdr.client_token, hdr.term); !e)
-            co_return std::unexpected(ring_handshake_failed(*conn, e.error()));
+        if (!conn->ready()) {
+            if (auto e = co_await bind_ring(*conn, hdr)) co_return std::unexpected(*e);
+        }
         auto const t0 = std::chrono::steady_clock::now();
         auto r = co_await conn->keep_alive(hdr.commit_lsn, hdr.all_committed_lsn);
         rt_keepalive_.add(ns_since(t0));
@@ -440,9 +442,9 @@ async_result< resolution_result > CraftTcpReplica::request_resolution(::io_uring
     // must not hop to a blocking round-trip. A round is slow leader work, but the pump demuxes replies by
     // request_id, so the parked leg costs the data ops in flight nothing.
     if (auto* conn = conn_for(q)) {
-        if (auto r = refused()) co_return std::unexpected(*r);
-        if (auto e = co_await conn->ensure_ready(vol_id_, hdr.client_token, hdr.term); !e)
-            co_return std::unexpected(ring_handshake_failed(*conn, e.error()));
+        if (!conn->ready()) {
+            if (auto e = co_await bind_ring(*conn, hdr)) co_return std::unexpected(*e);
+        }
         auto r = co_await conn->resolve(upto, hdr.commit_lsn, hdr.all_committed_lsn);
         if (!r) co_return std::unexpected(net_to_error(r.error()));
         if (r->status != wire::status::ok) co_return std::unexpected(status_to_error(r->status));
