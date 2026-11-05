@@ -20,6 +20,7 @@
 
 #include <craft/client.hpp> // result types
 #include <craft/types.hpp>  // the CRAFT vocabulary
+#include <craft/status.hpp> // the wire status <-> craft_error bridge
 
 // The client-facing async aliases are exactly sisl's canonical FREESTANDING result carrier (no fork, and no
 // stdexec: light_task resumes its awaiter inline on the completing thread).
@@ -50,4 +51,21 @@ TEST(CraftTypes, DataStructDefaults) {
 craft::async_status ok_coro() { co_return sisl::ok(); }
 craft::async_result< craft::lsn_pair > fenced_coro() {
     co_return std::unexpected(craft::make_error_condition(craft::craft_error::STALE_TERM));
+}
+
+// AUTH statuses are valid only on AUTH replies. On any other reply they are a protocol violation, so the op is
+// not provably undelivered and must not count toward a write's Empty verdict.
+TEST(CraftTypes, AuthStatusOnNonAuthReplyIsNotDeterministic) {
+    using craft::wire::status;
+    for (auto const s : {status::not_exposed, status::stale_credential, status::auth_failed})
+        EXPECT_EQ(craft::status_to_error(s), std::make_error_condition(std::errc::timed_out)) << static_cast< int >(s);
+}
+
+TEST(CraftTypes, AuthRefusalsMapToTheirWireStatus) {
+    using craft::craft_error;
+    using craft::wire::status;
+    EXPECT_EQ(craft::to_wire_status(craft::make_error_condition(craft_error::NOT_EXPOSED)), status::not_exposed);
+    EXPECT_EQ(craft::to_wire_status(craft::make_error_condition(craft_error::STALE_CREDENTIAL)),
+              status::stale_credential);
+    EXPECT_EQ(craft::to_wire_status(craft::make_error_condition(craft_error::AUTH_FAILED)), status::auth_failed);
 }

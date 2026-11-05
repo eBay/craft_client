@@ -12,3 +12,8 @@
 # unsynchronized global, but there is no real hazard. This is a sisl-internal metrics characteristic, not a
 # craft_client bug (see the same race noted across the SDS stack).
 race:sisl::NamedCounter
+
+# OpenSSL 3 algorithm-fetch cache (benign). HMAC(EVP_sha256(), ...) looks the digest up in the library context's
+# lock-free hashtable: readers run under OpenSSL's RCU, writers under its lock. OpenSSL is not TSan-instrumented in
+# CI, so TSan cannot see the RCU ordering and flags a reader on one thread against an insert on another.
+race:crypto/hashtable/hashtable.c

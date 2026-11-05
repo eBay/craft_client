@@ -332,9 +332,9 @@ start**. A CRAFT read has no leader affinity -- any eligible replica serves it a
 every read at the leader would pile all read load on it; the rotor advances to the peer after the one it
 picks, so successive reads round-robin across eligible members. It is a `thread_local` (like ublkpp's RAID1):
 each ublk queue thread rotates its own reads, so there is no shared atomic and no cross-queue coordination,
-and the aggregate still spreads evenly. A holder that is down or times out fails over to the next eligible
-one; any other error (`STALE_TERM`) is the client's to surface. No eligible member serves it -> `NOT_ELIGIBLE`;
-holders existed but all failed the transport -> `NO_QUORUM`. Never a silent stale read. `dest` is filled in
+and the aggregate still spreads evenly. A holder that is down, times out, refuses AUTH, or answers HELO
+`NOT_LEADER` fails over to the next eligible one; any other error (`STALE_TERM`) is the client's to surface. No
+eligible member serves it -> `NOT_ELIGIBLE`; holders existed but all failed the transport -> `NO_QUORUM`. Never a silent stale read. `dest` is filled in
 place, so a failover re-issues the same plan into the same buffer -- **no payload copy** (only the iovec
 descriptors are copied per attempt).
 

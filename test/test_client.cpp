@@ -25,6 +25,7 @@
 #include <chrono>
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <thread>
 #include <vector>
 
@@ -861,6 +862,140 @@ TEST(CraftClient, ReadDrivesKeepAliveToSkippedLegs) {
     while (total_ka() < 2 && std::chrono::steady_clock::now() < deadline)
         std::this_thread::sleep_for(std::chrono::milliseconds{1});
     EXPECT_GE(total_ka(), 2u) << "the two legs the read skipped each got a (fire-and-forget) keep_alive";
+}
+
+namespace {
+
+// Delegates to a real replica; with `reject` set, every data-path verb fails as a replica that refused the
+// connection at AUTH (before any op was sent on it).
+class auth_gated_replica final : public craft::craft_replica {
+public:
+    explicit auth_gated_replica(std::shared_ptr< craft::craft_replica > inner) : inner_{std::move(inner)} {}
+
+    std::optional< craft::craft_error > reject;
+
+    async_result< LoginResult > login(uint64_t client_token) override { return inner_->login(client_token); }
+    async_status logout(client_hdr hdr) override { return inner_->logout(hdr); }
+    async_result< lsn_pair > write(::io_uring* q, client_hdr hdr, int64_t dlsn, uint64_t addr, uint64_t len,
+                                   sisl::sg_list data) override {
+        if (reject) co_return std::unexpected(make_error_condition(*reject));
+        co_return co_await inner_->write(q, hdr, dlsn, addr, len, std::move(data));
+    }
+    async_result< read_result > read(::io_uring* q, client_hdr hdr, int64_t read_lsn, uint64_t addr, uint64_t len,
+                                     sisl::sg_list dest) override {
+        if (reject) co_return std::unexpected(make_error_condition(*reject));
+        co_return co_await inner_->read(q, hdr, read_lsn, addr, len, std::move(dest));
+    }
+    async_result< lsn_pair > keep_alive(::io_uring* q, client_hdr hdr) override {
+        if (reject) co_return std::unexpected(make_error_condition(*reject));
+        co_return co_await inner_->keep_alive(q, hdr);
+    }
+    async_result< resolution_result > request_resolution(::io_uring* q, client_hdr hdr, int64_t upto) override {
+        if (reject) co_return std::unexpected(make_error_condition(*reject));
+        co_return co_await inner_->request_resolution(q, hdr, upto);
+    }
+    peer_id_t id() const override { return inner_->id(); }
+
+private:
+    std::shared_ptr< craft::craft_replica > inner_;
+};
+
+struct GatedCluster {
+    craft::MemReplicaGroup set;
+    std::vector< std::shared_ptr< auth_gated_replica > > gates;
+    std::shared_ptr< craft::craft_client > client;
+};
+
+GatedCluster make_gated_cluster(uint32_t n) {
+    auto set = craft::make_mem_replica_group(boost::uuids::random_generator()(), n, PAGE);
+    std::vector< std::shared_ptr< auth_gated_replica > > gates;
+    std::vector< std::shared_ptr< craft::craft_replica > > backends;
+    for (auto const& r : set.replicas) {
+        gates.push_back(std::make_shared< auth_gated_replica >(r));
+        backends.push_back(gates.back());
+    }
+    auto client = std::make_shared< craft::craft_client >(std::move(backends), 0);
+    EXPECT_TRUE(rg(client->login(TOKEN)).has_value());
+    return GatedCluster{std::move(set), std::move(gates), std::move(client)};
+}
+
+} // namespace
+
+// An AUTH refusal means the write never reached that replica, but the volume may have been handed to a successor
+// that holds the slot. Like STALE_TERM, an all-refused write never resolves Empty: the frontier stays pinned.
+TEST(CraftClient, AllReplicasAuthRejectPinsFrontier) {
+    auto cl = make_gated_cluster(3);
+    auto buf = page_of(1);
+    ASSERT_TRUE(wr(*cl.client, 1, buf));
+    EXPECT_EQ(cl.client->commit_lsn(), 0);
+
+    for (auto& g : cl.gates)
+        g->reject = craft::craft_error::STALE_CREDENTIAL;
+    EXPECT_FALSE(wr(*cl.client, 2, buf));
+    // Checked while the rejects still stand, so no later resolution round can be what Emptied the slot.
+    EXPECT_EQ(cl.client->commit_lsn(), 0) << "dLSN 1 must stay unresolved, not Empty";
+    for (auto& g : cl.gates)
+        g->reject.reset();
+}
+
+// Login admits through the leader, but if the members that refuse the credential leave no quorum, it fails at once
+// with the refusal (the caller needs fresh attach info), not NO_QUORUM after the admit deadline.
+TEST(CraftClient, LoginFailsFastWhenAuthRejectsBreakQuorum) {
+    auto set = craft::make_mem_replica_group(boost::uuids::random_generator()(), 3, PAGE);
+    std::vector< std::shared_ptr< auth_gated_replica > > gates;
+    std::vector< std::shared_ptr< craft::craft_replica > > backends;
+    for (auto const& r : set.replicas) {
+        gates.push_back(std::make_shared< auth_gated_replica >(r));
+        backends.push_back(gates.back());
+    }
+    gates[1]->reject = craft::craft_error::STALE_CREDENTIAL;
+    gates[2]->reject = craft::craft_error::STALE_CREDENTIAL;
+    craft::craft_client client{std::move(backends), 0};
+
+    auto const t0 = std::chrono::steady_clock::now();
+    auto const r = rg(client.login(TOKEN));
+    ASSERT_FALSE(r.has_value());
+    EXPECT_EQ(r.error(), make_error_condition(craft::craft_error::STALE_CREDENTIAL));
+    EXPECT_LT(std::chrono::steady_clock::now() - t0, std::chrono::seconds{1}) << "must not wait out the admit deadline";
+}
+
+// One refusing member still leaves a quorum, so login admits.
+TEST(CraftClient, LoginAdmitsPastASingleAuthReject) {
+    auto set = craft::make_mem_replica_group(boost::uuids::random_generator()(), 3, PAGE);
+    std::vector< std::shared_ptr< craft::craft_replica > > backends;
+    for (auto const& r : set.replicas)
+        backends.push_back(std::make_shared< auth_gated_replica >(r));
+    std::static_pointer_cast< auth_gated_replica >(backends[2])->reject = craft::craft_error::NOT_EXPOSED;
+    craft::craft_client client{std::move(backends), 0};
+    EXPECT_TRUE(rg(client.login(TOKEN)).has_value());
+}
+
+// A read fails over past replicas that reject AUTH, from every rotating start.
+TEST(CraftClient, ReadFailsOverPastAuthRejects) {
+    auto cl = make_gated_cluster(3);
+    auto data = page_of(0x6D);
+    ASSERT_TRUE(wr(*cl.client, 4, data));
+
+    cl.gates[0]->reject = craft::craft_error::AUTH_FAILED;
+    cl.gates[1]->reject = craft::craft_error::NOT_EXPOSED;
+    for (int i = 0; i < 3; ++i)
+        EXPECT_EQ(rd(*cl.client, 4), data) << "read " << i;
+    for (auto& g : cl.gates)
+        g->reject.reset();
+}
+
+// A member whose HELO answers NOT_LEADER is skipped like a down one; reads are not leader-only.
+TEST(CraftClient, ReadFailsOverPastHeloNotLeader) {
+    auto cl = make_gated_cluster(3);
+    auto data = page_of(0x4E);
+    ASSERT_TRUE(wr(*cl.client, 4, data));
+
+    cl.gates[0]->reject = craft::craft_error::NOT_LEADER;
+    cl.gates[1]->reject = craft::craft_error::NOT_LEADER;
+    for (int i = 0; i < 3; ++i)
+        EXPECT_EQ(rd(*cl.client, 4), data) << "read " << i;
+    for (auto& g : cl.gates)
+        g->reject.reset();
 }
 
 int main(int argc, char* argv[]) {

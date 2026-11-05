@@ -23,6 +23,7 @@
 // identity) interoperates freely because it is the SAME underlying type.
 
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <system_error>
 #include <vector>
@@ -52,10 +53,20 @@ using async_status = sisl::async::light_status;
 template < typename T >
 using result = sisl::result< T >;
 
+// A replica's AUTH credential, as provisioned by the control plane (docs/wire.md "Authentication"). Both
+// fields are used byte-for-byte as delivered.
+struct auth_credential {
+    std::string username;
+    std::string password;
+};
+
 // Network address of a replica, as returned in login()'s member list.
 struct replica_endpoint {
     peer_id_t id;
     std::string addr; // "host:port"
+    // Set: every connection to this replica must complete AUTH first, fail-closed. Unset: no AUTH, which only a
+    // replica that does not enforce it (the reference server) admits. Never set on login()'s member list.
+    std::optional< auth_credential > credential{};
 };
 
 // {commit_lsn, last_append_lsn} snapshot -- returned by get_lsns() / keep_alive().
@@ -144,7 +155,10 @@ ENUM(craft_error, uint16_t,
      NOT_ELIGIBLE,   // replica cannot serve this read (Missing overlap / below login-dLSN L)
      REPLICA_DOWN,   // addressed replica is down (fault injection / unreachable)
      INTERNAL,       // unexpected internal failure
-     NOT_IMPLEMENTED)
+     NOT_IMPLEMENTED,
+     NOT_EXPOSED,      // AUTH: the replica holds no credential for the volume
+     STALE_CREDENTIAL, // AUTH: the credential was rotated; get fresh attach info
+     AUTH_FAILED)      // AUTH: refused, a proof did not verify (either direction), or the local credential is unusable
 
 class craft_error_category : public std::error_category {
 public:

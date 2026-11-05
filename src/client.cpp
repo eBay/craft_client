@@ -43,6 +43,13 @@ constexpr int64_t k_fold_batch = 512;
 // range, so the client re-probes until this deadline, then fails admission -- it never opens I/O it cannot serve.
 constexpr auto k_admit_timeout = std::chrono::seconds{5};
 
+// The replica refused the connection at AUTH, before any op was sent on it.
+static bool auth_rejected(std::error_condition const& e) {
+    return (e == make_error_condition(craft_error::NOT_EXPOSED)) ||
+        (e == make_error_condition(craft_error::STALE_CREDENTIAL)) ||
+        (e == make_error_condition(craft_error::AUTH_FAILED));
+}
+
 void craft_client::maybe_fold() {
     int64_t const F = tracker_->frontier();
     if (F - route_->folded() >= k_fold_batch) route_->fold_to(F);
@@ -114,14 +121,24 @@ async_status craft_client::login(uint64_t client_token) {
                 probes.push_back(h->keep_alive(nullptr, probe_hdr));
             auto const acks = co_await sisl::async::when_all(std::move(probes));
             std::size_t acked = 0;
+            std::size_t refused = 0; // sticky: these members can never ack with this credential
+            std::error_condition refusal{};
             bool holder_at_L = false;
             for (std::size_t i = 0; i < replicas_.size(); ++i) {
-                if (!acks[i].has_value()) continue;
+                if (!acks[i].has_value()) {
+                    if (auth_rejected(acks[i].error())) {
+                        ++refused;
+                        refusal = acks[i].error();
+                    }
+                    continue;
+                }
                 ++acked;
                 route_->advance_synced(i, acks[i]->commit_lsn);
                 if (acks[i]->commit_lsn >= L) holder_at_L = true;
             }
             if (acked >= quorum() && holder_at_L) co_return ok(); // quorum established + L is servable -> admit
+            // Only fresh attach info can fix this, so say so now instead of NO_QUORUM at the deadline.
+            if (replicas_.size() - refused < quorum()) co_return std::unexpected(refusal);
             if (std::chrono::steady_clock::now() >= admit_deadline)
                 co_return std::unexpected(make_error_condition(craft_error::NO_QUORUM));
             // else: sub-quorum, or nobody holds L yet. Re-probe -- the round-trip paces the retry, and a member
@@ -194,7 +211,8 @@ async_result< size_t > craft_client::write(::io_uring* q, uint64_t addr, uint64_
     // provably did not journal it (invalid_argument: refused; REPLICA_DOWN: never delivered). If EVERY replica
     // rejected deterministically, nobody holds the slot: Empty, a resolved no-op. A subset proves nothing, so
     // the slot stays unresolved and commit correctly stalls. A timeout must NEVER count (the peer may have
-    // appended while the reply outran the deadline); STALE_TERM must not either (a successor may hold the slot).
+    // appended while the reply outran the deadline); STALE_TERM and the AUTH refusals must not either (a successor
+    // may hold the slot).
     static constexpr auto deterministic_reject = [](std::error_condition const& e) {
         return (e == std::make_error_condition(std::errc::invalid_argument)) ||
             (e == make_error_condition(craft_error::REPLICA_DOWN));
@@ -341,7 +359,9 @@ async_result< size_t > craft_client::read(::io_uring* q, uint64_t addr, uint64_t
 
         last_err = r.error();
         bool const transport_failure = (last_err == make_error_condition(craft_error::REPLICA_DOWN)) ||
-            (last_err == std::make_error_condition(std::errc::timed_out));
+            (last_err == std::make_error_condition(std::errc::timed_out)) || auth_rejected(last_err) ||
+            // Reads are not leader-only, so NOT_LEADER here is this member's HELO refusing to bind.
+            (last_err == make_error_condition(craft_error::NOT_LEADER));
         if (!transport_failure) co_return std::unexpected(last_err);
         // else: this holder is unreachable right now; try the next eligible member.
     }

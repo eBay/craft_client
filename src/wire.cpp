@@ -43,6 +43,10 @@ std::optional< std::size_t > op_hdr_size(uint8_t op_code) noexcept {
         sizeof(get_rs_commit_lsn_rsp), // 18 get_rs_commit_lsn_rsp
         sizeof(fetch_data_req),        // 19 fetch_data
         sizeof(fetch_data_rsp),        // 20 fetch_data_rsp
+        sizeof(auth_start_req),        // 21 auth_start
+        sizeof(auth_challenge_rsp),    // 22 auth_challenge
+        sizeof(auth_proof_req),        // 23 auth_proof
+        sizeof(auth_result_rsp),       // 24 auth_result
     };
     static_assert(std::size(k) == static_cast< std::size_t >(op::k_max_op) + 1,
                   "op_hdr_size table and op::k_max_op disagree -- a new opcode was added without a header size, "
@@ -58,13 +62,14 @@ bool is_response(uint8_t op_code) noexcept {
 }
 
 bool op_allows_body(uint8_t op_code) noexcept {
-    return op_code == static_cast< uint8_t >(op::write) ||      // data
-        op_code == static_cast< uint8_t >(op::login_rsp) ||     // member list
-        op_code == static_cast< uint8_t >(op::read_rsp) ||      // extents + data
-        op_code == static_cast< uint8_t >(op::resolve_rsp) ||   // Empty-verdict dLSN list
-        op_code == static_cast< uint8_t >(op::create_volume) || // member list
-        op_code == static_cast< uint8_t >(op::fetch_data) ||    // lsns
-        op_code == static_cast< uint8_t >(op::fetch_data_rsp);  // slot_count x fetch_slot_desc + data
+    return op_code == static_cast< uint8_t >(op::write) ||       // data
+        op_code == static_cast< uint8_t >(op::login_rsp) ||      // member list
+        op_code == static_cast< uint8_t >(op::read_rsp) ||       // extents + data
+        op_code == static_cast< uint8_t >(op::resolve_rsp) ||    // Empty-verdict dLSN list
+        op_code == static_cast< uint8_t >(op::create_volume) ||  // member list
+        op_code == static_cast< uint8_t >(op::fetch_data) ||     // lsns
+        op_code == static_cast< uint8_t >(op::fetch_data_rsp) || // slot_count x fetch_slot_desc + data
+        op_code == static_cast< uint8_t >(op::auth_start);       // username
 }
 
 namespace {

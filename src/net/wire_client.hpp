@@ -33,6 +33,7 @@
 #include <expected>
 #include <span>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include <craft/net/conn.hpp>
@@ -86,6 +87,11 @@ public:
     // separately by set_op_timeout.
     static std::expected< wire_client, net_error >
     connect(std::string const& host, uint16_t port, std::chrono::milliseconds connect_timeout = k_connect_timeout);
+
+    // Run AUTH (docs/wire.md "Authentication") on this fresh connection, before LOGIN / HELO. `timeout` bounds
+    // each reply. Fail-closed: on any error the caller drops the connection.
+    std::expected< void, net_error > authenticate(std::array< uint8_t, 16 > const& volume_id, std::string_view username,
+                                                  std::string_view password, std::chrono::milliseconds timeout);
 
     // ── session ──
     // LOGIN names the volume (the design's login(client_token, vol_id)): a multi-volume server routes the

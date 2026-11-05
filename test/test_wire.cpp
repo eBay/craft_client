@@ -78,8 +78,12 @@ TEST(CraftWire, OpHeaderSizes) {
     EXPECT_EQ(op_hdr_size(static_cast< uint8_t >(op::get_rs_commit_lsn_rsp)), 16u);
     EXPECT_EQ(op_hdr_size(static_cast< uint8_t >(op::fetch_data)), 8u);
     EXPECT_EQ(op_hdr_size(static_cast< uint8_t >(op::fetch_data_rsp)), 8u);
+    EXPECT_EQ(op_hdr_size(static_cast< uint8_t >(op::auth_start)), 56u);
+    EXPECT_EQ(op_hdr_size(static_cast< uint8_t >(op::auth_challenge)), 32u);
+    EXPECT_EQ(op_hdr_size(static_cast< uint8_t >(op::auth_proof)), 32u);
+    EXPECT_EQ(op_hdr_size(static_cast< uint8_t >(op::auth_result)), 32u);
     EXPECT_FALSE(op_hdr_size(0).has_value());
-    EXPECT_FALSE(op_hdr_size(21).has_value());
+    EXPECT_FALSE(op_hdr_size(25).has_value());
     EXPECT_FALSE(op_hdr_size(99).has_value());
 
     EXPECT_TRUE(is_response(static_cast< uint8_t >(op::write_rsp)));
@@ -113,6 +117,45 @@ TEST(CraftWire, RoundTripResolve) {
     ASSERT_TRUE(got.has_value());
     EXPECT_EQ(*got, empties);
     EXPECT_FALSE(decode_lsns(rsp->body, 100).has_value()); // truncated list is rejected
+}
+
+// AUTH_START carries the username as its body; the other AUTH ops are bodyless and the responses are responses.
+TEST(CraftWire, RoundTripAuth) {
+    auth_start_req st{};
+    st.version = k_auth_version;
+    st.volume_id[0] = 0x5A;
+    st.client_nonce[31] = 0xC1;
+    std::string_view const user = "0123456789abcdef0123456789abcdef";
+    std::span< uint8_t const > const user_bytes{reinterpret_cast< uint8_t const* >(user.data()), user.size()};
+
+    auto buf = frame(op::auth_start, 0, /*rid*/ 1, bytes(st), user_bytes);
+    auto r = parse_message(buf, kMaxTx);
+    ASSERT_TRUE(r.has_value());
+    EXPECT_EQ(r->total, 8u + 56u + user.size());
+    auto const st2 = decode< auth_start_req >(r->op_header);
+    EXPECT_EQ(st2.version, k_auth_version);
+    EXPECT_EQ(st2.volume_id, st.volume_id);
+    EXPECT_EQ(st2.client_nonce, st.client_nonce);
+    EXPECT_EQ(std::string_view(reinterpret_cast< char const* >(r->body.data()), r->body.size()), user);
+
+    auth_challenge_rsp ch{};
+    ch.server_nonce[0] = 0x5E;
+    auto ch_buf = frame(op::auth_challenge, static_cast< uint8_t >(status::stale_credential), 1, bytes(ch), {});
+    auto rc = parse_message(ch_buf, kMaxTx);
+    ASSERT_TRUE(rc.has_value());
+    EXPECT_TRUE(is_response(rc->hdr.op));
+    EXPECT_EQ(rc->hdr.status, 9u);
+    EXPECT_EQ(decode< auth_challenge_rsp >(rc->op_header).server_nonce, ch.server_nonce);
+
+    EXPECT_TRUE(op_allows_body(static_cast< uint8_t >(op::auth_start)));
+    for (auto const o : {op::auth_challenge, op::auth_proof, op::auth_result})
+        EXPECT_FALSE(op_allows_body(static_cast< uint8_t >(o)));
+    EXPECT_FALSE(is_response(static_cast< uint8_t >(op::auth_proof)));
+    EXPECT_TRUE(is_response(static_cast< uint8_t >(op::auth_result)));
+
+    auth_proof_req pr{};
+    auto bad = frame(op::auth_proof, 0, 2, bytes(pr), user_bytes);
+    EXPECT_EQ(parse_message(bad, kMaxTx).error(), parse_error::bad_length);
 }
 
 // A WRITE request round-trips: header fields and the payload survive frame -> parse -> decode.

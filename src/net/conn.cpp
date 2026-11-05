@@ -29,10 +29,30 @@
 #include <optional>
 #include <utility>
 
+#if defined(__SANITIZE_THREAD__)
+#include <sanitizer/tsan_interface.h>
+#endif
+
 namespace craft::net {
 
 namespace {
 constexpr unsigned k_ring_entries = 8; // one op in flight at a time (blocking submit-and-wait)
+
+// liburing maps and unmaps rings with raw syscalls, so TSan never sees a ring's memory released and flags a new
+// ring mapped at a reused address as racing the old one. Reuse means the kernel ordered the unmap first; mirror
+// that per mapped address, so only rings that actually share an address are ordered.
+void ring_unmapping([[maybe_unused]] ::io_uring const& r) noexcept {
+#if defined(__SANITIZE_THREAD__)
+    for (void* p : {static_cast< void* >(r.sq.sqes), r.sq.ring_ptr, r.cq.ring_ptr})
+        __tsan_release(p);
+#endif
+}
+void ring_mapped([[maybe_unused]] ::io_uring const& r) noexcept {
+#if defined(__SANITIZE_THREAD__)
+    for (void* p : {static_cast< void* >(r.sq.sqes), r.sq.ring_ptr, r.cq.ring_ptr})
+        __tsan_acquire(p);
+#endif
+}
 constexpr std::size_t k_recv_chunk = 16 * 1024;
 
 namespace {
@@ -75,6 +95,7 @@ craft_conn& craft_conn::operator=(craft_conn&& o) noexcept {
 
 void craft_conn::close_all() noexcept {
     if (ring_ready_) {
+        ring_unmapping(ring_);
         io_uring_queue_exit(&ring_);
         ring_ready_ = false;
     }
@@ -91,6 +112,7 @@ std::expected< craft_conn, net_error > craft_conn::adopt(int fd) {
         ::close(fd);
         return std::unexpected(net_error::setup);
     }
+    ring_mapped(c.ring_);
     c.ring_ready_ = true;
     return c;
 }

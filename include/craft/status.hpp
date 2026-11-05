@@ -27,7 +27,8 @@
 
 namespace craft {
 
-// A core's std::error_condition (craft_error / std::errc) -> the response status byte. Server side.
+// A core's std::error_condition (craft_error / std::errc) -> the response status byte. Server side. The server must
+// send the AUTH statuses (NOT_EXPOSED / STALE_CREDENTIAL / AUTH_FAILED) only on AUTH replies.
 inline wire::status to_wire_status(std::error_condition const& e) {
     if (e == craft_error::STALE_TERM) return wire::status::stale_term;
     if (e == craft_error::NOT_LEADER) return wire::status::not_leader;
@@ -36,6 +37,9 @@ inline wire::status to_wire_status(std::error_condition const& e) {
     if (e == craft_error::NOT_ELIGIBLE) return wire::status::not_eligible;
     if (e == craft_error::REPLICA_DOWN) return wire::status::replica_down;
     if (e == std::errc::invalid_argument) return wire::status::invalid_argument;
+    if (e == craft_error::NOT_EXPOSED) return wire::status::not_exposed;
+    if (e == craft_error::STALE_CREDENTIAL) return wire::status::stale_credential;
+    if (e == craft_error::AUTH_FAILED) return wire::status::auth_failed;
     return wire::status::internal;
 }
 
@@ -56,6 +60,12 @@ inline std::error_condition status_to_error(wire::status s) {
         return make_error_condition(craft_error::REPLICA_DOWN);
     case wire::status::invalid_argument:
         return std::make_error_condition(std::errc::invalid_argument);
+    case wire::status::not_exposed:
+    case wire::status::stale_credential:
+    case wire::status::auth_failed:
+        // AUTH-only statuses (the AUTH replies are mapped by the transport, not here). On any other reply they
+        // are a protocol violation, so the op is not provably undelivered: treat it like a lost reply.
+        return std::make_error_condition(std::errc::timed_out);
     default:
         return make_error_condition(craft_error::REPLICA_DOWN);
     }
