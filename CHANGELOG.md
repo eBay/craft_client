@@ -24,7 +24,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - A connect-phase failure on the on-ring path (connect, AUTH, or a failed HELO exchange) is now reported as
   `REPLICA_DOWN` rather than `timed_out`: the op was never sent, so it counts toward a write's provably-Empty
   verdict and a read fails over past it. A HELO the replica rejects keeps its status (e.g. `STALE_TERM`), as on the
-  blocking path.
+  blocking path; a read fails over past a HELO `NOT_LEADER`, which only a member refusing to bind sends.
 - `status_to_error` maps statuses 8-10 on a non-AUTH reply to `timed_out` (a protocol violation, classified like a
   lost reply). `to_wire_status` maps the AUTH errors to them; a server sends them only on AUTH replies.
 - `craft_error::NOT_EXPOSED`, `STALE_CREDENTIAL`, `AUTH_FAILED`. A read fails over past them. Like `STALE_TERM`,

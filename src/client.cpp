@@ -359,7 +359,9 @@ async_result< size_t > craft_client::read(::io_uring* q, uint64_t addr, uint64_t
 
         last_err = r.error();
         bool const transport_failure = (last_err == make_error_condition(craft_error::REPLICA_DOWN)) ||
-            (last_err == std::make_error_condition(std::errc::timed_out)) || auth_rejected(last_err);
+            (last_err == std::make_error_condition(std::errc::timed_out)) || auth_rejected(last_err) ||
+            // Reads are not leader-only, so NOT_LEADER here is this member's HELO refusing to bind.
+            (last_err == make_error_condition(craft_error::NOT_LEADER));
         if (!transport_failure) co_return std::unexpected(last_err);
         // else: this holder is unreachable right now; try the next eligible member.
     }

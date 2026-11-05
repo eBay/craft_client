@@ -984,6 +984,20 @@ TEST(CraftClient, ReadFailsOverPastAuthRejects) {
         g->reject.reset();
 }
 
+// A member whose HELO answers NOT_LEADER is skipped like a down one; reads are not leader-only.
+TEST(CraftClient, ReadFailsOverPastHeloNotLeader) {
+    auto cl = make_gated_cluster(3);
+    auto data = page_of(0x4E);
+    ASSERT_TRUE(wr(*cl.client, 4, data));
+
+    cl.gates[0]->reject = craft::craft_error::NOT_LEADER;
+    cl.gates[1]->reject = craft::craft_error::NOT_LEADER;
+    for (int i = 0; i < 3; ++i)
+        EXPECT_EQ(rd(*cl.client, 4), data) << "read " << i;
+    for (auto& g : cl.gates)
+        g->reject.reset();
+}
+
 int main(int argc, char* argv[]) {
     int parsed_argc = argc;
     ::testing::InitGoogleTest(&parsed_argc, argv);
