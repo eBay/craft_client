@@ -228,3 +228,5 @@ The three roles map cleanly onto three repos, and **HomeBlocks is only ever the 
 | **hole** | A read sub-range with no data (never/zero-written); returned as a marker, read as zeros. Not `Missing`. |
 | **io_extent** | One sub-range of a read's sparse layout, in bytes: `{addr, len, hole}` -- carries no bytes. |
 | **client_hdr** | Session + watermark fields stamped on every IO: `{term, commit_lsn, all_committed_lsn}`. |
+
+<!-- dummy test PR: do not merge -->
