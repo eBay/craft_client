@@ -387,6 +387,13 @@ result< LoginResult > MemTransport::run_login(MemCraftReplica* caller, uint64_t 
         members_copy = members_;
     }
     // Drive the cold path WITHOUT holding mu_ (each replica call takes only its own lock).
+    // Phase 0: fence. Every live replica switches to the new term BEFORE it is polled, so from here on it rejects
+    // the old session's writes: none can reach quorum after the absence scan below and then be voided by it. In
+    // this model a write is applied atomically under the replica's lock, so there is no admitted-but-unfinished
+    // write to drain; a delayed delivery that arrives later carries the old term and is rejected. Nobody writes
+    // under the new term until this login returns, so the early switch admits no one.
+    for (auto* r : live)
+        r->cold_fence(nt);
     // Phase 1: GetRSCommitLSN -> rs_commit_lsn = max(quorum.last_append_lsn).
     int64_t rs = -1;
     for (auto* r : live)

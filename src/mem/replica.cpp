@@ -511,6 +511,11 @@ void MemCraftReplica::cold_apply_sync(int64_t rs_commit_lsn, uint64_t /*client_t
     // SyncRSCommitLSN: (seam) fetch any missing non-Empty slots <= rs from peers, then advance commit.
     apply_up_to(rs_commit_lsn);
 }
+void MemCraftReplica::cold_fence(uint64_t term) {
+    std::lock_guard< std::mutex > g{mu_};
+    state_.term = term; // old-session writes now fail STALE_TERM; the session itself is installed by cold_apply_login
+    on_state_changed();
+}
 void MemCraftReplica::cold_apply_login(uint64_t client_token, uint64_t term) {
     std::lock_guard< std::mutex > g{mu_};
     state_.client_token = client_token;

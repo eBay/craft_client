@@ -174,6 +174,7 @@ private:
     wire::status helo_rejection_{wire::status::ok}; // the last attempt's HELO refusal, ok if none
     uint64_t helo_rejected_term_{0};
     int fd_{-1};
+    uint64_t conn_gen_{0}; // bumped for every new socket: a stale op's teardown must not close a newer one
     bool ready_{false};
     bool stopping_{false};
     bool connecting_{false};
