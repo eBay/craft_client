@@ -701,3 +701,37 @@ TEST(CraftAuthHandshake, OnRingStaleSendCannotReleaseANewerFramesSlot) {
     }
     replica.join();
 }
+
+// An op queued for the send slot when the connection is torn down never sends anything: it fails with `send`
+// (provably never delivered), not `closed` (delivery uncertain) -- callers retire a never-delivered write's slot
+// instead of pinning it until the next login (review on craft_client #6).
+TEST(CraftAuthHandshake, OnRingQueuedOpFailsAsNeverSentOnTeardown) {
+    auto rs = replica_script{};
+    rs.enforce = false;
+    rs.connections = 2;
+    scripted_replica replica{rs};
+    {
+        ring_session ring{replica.port(), std::nullopt};
+        ASSERT_TRUE(ring.ready().has_value());
+
+        auto* conn = ring.conn.get();
+        auto b = std::make_shared< ka_result >();
+        int calls = 0;
+        ring.conn->set_send_fault_for_test([&, conn, b](std::size_t, std::size_t) -> long {
+            if (++calls == 1) {
+                issue_conn_keep_alive(conn, b).detach(); // queues behind A
+                conn->fail_all_for_test();               // teardown while B waits for the slot
+            }
+            return 0;
+        });
+        auto a = std::make_shared< ka_result >();
+        issue_conn_keep_alive(ring.conn.get(), a).detach();
+        ASSERT_TRUE(b->has_value());
+        ASSERT_FALSE(b->value().has_value());
+        EXPECT_EQ(b->value().error(), net::net_error::send);
+        EXPECT_EQ(calls, 1) << "B never reached the socket";
+        ASSERT_TRUE(ring.driver.drive_until([&] { return a->has_value(); }));
+        ring.driver.drain_for(std::chrono::milliseconds{50});
+    }
+    replica.join();
+}

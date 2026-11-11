@@ -237,9 +237,10 @@ craft_async_conn::round_trip(wire::op o, std::span< uint8_t const > op_hdr, std:
     // Hold the wire's send slot for the WHOLE of this message so its bytes are contiguous on the socket, then
     // release before waiting for the reply (the next op sends while we wait; replies demux by request_id).
     if (!co_await send_awaitable{this}) {
-        // Woken by fail_all() without the slot: the connection went down while we queued. Nothing was sent.
+        // Woken by fail_all() without the slot: the connection went down while we queued. Nothing was sent, so this
+        // is a send failure -- provably never delivered -- not `closed` (delivery uncertain).
         pending_.erase(rid);
-        co_return std::unexpected(net_error::closed);
+        co_return std::unexpected(net_error::send);
     }
     uint64_t const epoch = send_epoch_; // our ownership of the send slot
     uint64_t const gen = conn_gen_;     // the connection this frame goes out on
