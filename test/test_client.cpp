@@ -85,24 +85,21 @@ std::vector< uint8_t > rd(craft::craft_client& c, uint64_t off_blk, uint64_t nbl
     return dest;
 }
 
-// Only the leader accepts the write, so it journals the slot while quorum(3)=2 goes unmet: the slot fails --
-// and the failure fires the client-requested resolution round, which (leader up, quorum live) FILLS the slot
-// from the leader's copy and retires it: the failed write completes late, durable everywhere. Use this to
-// exercise the round; use write_subquorum_unhealed for the unresolved WINDOW.
+// Only the leader accepts the write, so it journals the slot while quorum(3)=2 goes unmet: the write fails and
+// the slot stays unresolved for the rest of the session (failed writes are resolved at the next login).
 void write_subquorum(Cluster& cl, uint64_t off_blk, std::vector< uint8_t >& buf) {
     cl.set.net->force_subquorum({craft::mem_replica_id(cl.vid, 0)});
     EXPECT_FALSE(wr(*cl.client, off_blk, buf));
     cl.set.net->clear_faults();
 }
 
-// Fail a write sub-quorum WITHOUT letting the resolution round heal it: the LEADER is down for the write, so
-// the round (leader-only) dies with REPLICA_DOWN and the slot stays unresolved -- the fencing window the
-// horizon tests pin. Replica 1 is the surviving sub-quorum holder.
+// Fail a write sub-quorum with the LEADER down for it, so replica 1 is the only holder -- the unresolved
+// window the horizon tests pin.
 void write_subquorum_unhealed(Cluster& cl, uint64_t off_blk, std::vector< uint8_t >& buf) {
     cl.set.replicas[0]->set_up(false);
     cl.set.net->force_subquorum({craft::mem_replica_id(cl.vid, 1)});
     EXPECT_FALSE(wr(*cl.client, off_blk, buf));
-    cl.set.net->clear_faults(); // everyone healthy again -- but nothing re-fires the dead round
+    cl.set.net->clear_faults(); // everyone healthy again -- the slot stays unresolved until the next login
 }
 } // namespace
 
@@ -245,32 +242,54 @@ TEST(CraftClient, N3_SplitReadServesEachBlockAtItsOwnHorizon) {
     EXPECT_EQ(cl.client->commit_lsn(), 0) << "the failed write still pins commit";
 }
 
-// --- the client-requested resolution round: a failed write is resolved NOW, not at the next login ---
+// --- failed writes: resolved at the next login, never during the session (HomeBlocks docs/craft/resync.md §4.4) ---
 
-// The round FILLS the slot: the leader holds the sub-quorum copy, so the round fetches it everywhere and the
-// failed write completes late (the design's benign false-include). The frontier releases immediately -- the
-// round runs synchronously in the in-process model -- and the value becomes the durable version of the block.
-TEST(CraftClient, N3_ResolutionRoundFillsAFailedWriteAndReleasesTheFrontier) {
+namespace {
+// A fresh client logging into the same replicas (the "next attach").
+std::shared_ptr< craft::craft_client > relogin(Cluster& cl, uint64_t token) {
+    std::vector< std::shared_ptr< craft::craft_replica > > backends(cl.set.replicas.begin(), cl.set.replicas.end());
+    auto fresh = std::make_shared< craft::craft_client >(std::move(backends));
+    EXPECT_TRUE(rg(fresh->login(token)).has_value());
+    return fresh;
+}
+} // namespace
+
+// A failed write is NOT resolved during the session: no resolution request is sent, the slot pins the
+// frontier, the other members never receive it, and overlapping reads are still served (old data).
+TEST(CraftClient, N3_FailedWriteIsNotResolvedDuringTheSession) {
     auto cl = make_cluster(3);
     auto v0 = page_of(0x40);
     auto v1 = page_of(0x41);
 
     ASSERT_TRUE(wr(*cl.client, 4, v0)); // dLSN 0
-    EXPECT_EQ(cl.client->commit_lsn(), 0);
-    write_subquorum(cl, 4, v1); // dLSN 1 fails; the round fires, fills from the leader, retires the slot
+    write_subquorum(cl, 4, v1);         // dLSN 1 fails: only the leader journals it
 
-    EXPECT_EQ(cl.client->commit_lsn(), 1) << "the round resolved the slot; nothing pins the frontier";
-    EXPECT_EQ(rd(*cl.client, 4), v1) << "the failed write completed late: it IS the durable version now";
-
-    // Every live member ends up holding the filled slot (the model's round pushes synchronously).
-    for (auto& r : cl.set.replicas)
-        EXPECT_EQ(r->stats().journal_slots, 2u);
+    EXPECT_EQ(cl.client->commit_lsn(), 0) << "the failed write pins the frontier for the rest of the session";
+    EXPECT_EQ(rd(*cl.client, 4), v0) << "an overlapping read is served as of just before the failed write";
+    EXPECT_EQ(cl.set.replicas[1]->stats().journal_slots, 1u) << "no mid-session round copied the slot";
+    EXPECT_EQ(cl.set.replicas[2]->stats().journal_slots, 1u);
 }
 
-// The round declares EMPTY: nobody holds the slot (the one copy is stuck in a 10s-delayed transport), so the
-// leader verdicts it Empty on quorum-lacks evidence and tombstones it -- the late arrival is then REJECTED
-// (reconciliation: Empty beats data), so no replica can resurrect a voided write.
-TEST(CraftClient, N3_ResolutionRoundVerdictsEmptyWhenNobodyHoldsTheSlot) {
+// The next login resolves it: a live member holds the slot, so it is filled everywhere -- the failed write
+// completed late (the design's benign false-include) and the frontier passes it.
+TEST(CraftClient, N3_NextLoginFillsAFailedWriteHeldByALiveMember) {
+    auto cl = make_cluster(3);
+    auto v0 = page_of(0x40);
+    auto v1 = page_of(0x41);
+    ASSERT_TRUE(wr(*cl.client, 4, v0));
+    write_subquorum(cl, 4, v1);
+
+    auto fresh = relogin(cl, TOKEN + 1);
+    EXPECT_EQ(fresh->commit_lsn(), 1) << "login resolved slot 1";
+    EXPECT_EQ(rd(*fresh, 4), v1) << "the failed write completed late: it is the durable version now";
+    for (auto& r : cl.set.replicas)
+        EXPECT_EQ(r->stats().journal_slots, 2u) << "every live member holds the filled slot";
+}
+
+// When no live member holds the failed write (its only copy is stuck in a 10 s-delayed transport), no replica's
+// last_append covers it, so the next login's starting point is below it: the write simply never happened, and
+// the new session reuses the dLSN. The late arrival carries the old term and is fenced out.
+TEST(CraftClient, N3_NextLoginDropsAFailedWriteNobodyHolds) {
     auto cl = make_cluster(3);
     cl.set.net->set_op_timeout(std::chrono::milliseconds{20});
     cl.set.net->set_delay(craft::mem_replica_id(cl.vid, 0), std::chrono::seconds{10}); // stuck, lands late
@@ -279,10 +298,14 @@ TEST(CraftClient, N3_ResolutionRoundVerdictsEmptyWhenNobodyHoldsTheSlot) {
     auto v = page_of(0x50);
     EXPECT_FALSE(wr(*cl.client, 7, v)); // leg 0 times out, legs 1-2 refuse -> failed (not provably absent)
     cl.set.net->clear_faults();
+    EXPECT_EQ(cl.client->commit_lsn(), -1) << "unresolved during the session";
 
-    EXPECT_EQ(cl.client->commit_lsn(), 0) << "the round verdicted dLSN 0 Empty and the frontier passed it";
-    EXPECT_EQ(rd(*cl.client, 7), page_of(0)) << "a voided write reads as never-written";
-    EXPECT_GE(cl.set.replicas[1]->stats().empty_slots, 1u) << "the verdict tombstone is journaled";
+    auto fresh = relogin(cl, TOKEN + 1);
+    EXPECT_EQ(fresh->commit_lsn(), -1) << "nobody holds dLSN 0, so the login starting point is below it";
+    EXPECT_EQ(rd(*fresh, 7), page_of(0)) << "the failed write reads as never-written";
+    auto w = page_of(0x51);
+    ASSERT_TRUE(wr(*fresh, 7, w)) << "the new session reuses dLSN 0";
+    EXPECT_EQ(rd(*fresh, 7), w);
 }
 
 // --- session establishment ---
@@ -737,8 +760,12 @@ TEST(CraftClient, ReLoginMustNotServeStaleFollower) {
 
     // Re-login drops the Missing map; member 2 is now gated only by Synced, which the client seeds from member
     // 2's own commit_lsn (< L, since it never applied dLSN 1) -- so it stays ineligible despite still holding 0xAA.
+    // Member 2 is DOWN during the login: a live member would be healed by the login's resolution step (filled
+    // from a holder), and this test is about a member that is still behind afterwards.
     ASSERT_TRUE(rg(cl.client->logout()).has_value());
+    cl.set.replicas[2]->set_up(false);
     ASSERT_TRUE(rg(cl.client->login(TOKEN)).has_value());
+    cl.set.replicas[2]->set_up(true);
     EXPECT_FALSE(cl.client->route_caught_up(2)) << "member 2 still behind after re-login -- must not be trusted";
 
     // Every read must return the committed 0xBB. Read enough times that the round-robin rotor would visit all

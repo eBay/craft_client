@@ -134,7 +134,6 @@ public:
         for (std::size_t i = 0; i < n; ++i) {
             synced_[i].store(k_unsynced, std::memory_order_relaxed); // raised per-member from its real commit_lsn
             ka_inflight_[i].store(false, std::memory_order_relaxed);
-            rr_inflight_[i].store(false, std::memory_order_relaxed);
         }
         all_committed_.store(k_unsynced, std::memory_order_relaxed); // min synced_; rises as members report in
         {
@@ -329,12 +328,6 @@ public:
     bool try_begin_keepalive(std::size_t idx) { return !ka_inflight_[idx].exchange(true, std::memory_order_acq_rel); }
     void end_keepalive(std::size_t idx) { ka_inflight_[idx].store(false, std::memory_order_release); }
 
-    // The identical collapse for the client-requested resolution round: at most ONE outstanding
-    // request_resolution per member. A burst of failed in-flight writes tops a peer up again only once its
-    // previous request completed, never one request per failure (the want watermark in dlsn_tracker is what
-    // accumulates the burst).
-    bool try_begin_resolution(std::size_t idx) { return !rr_inflight_[idx].exchange(true, std::memory_order_acq_rel); }
-    void end_resolution(std::size_t idx) { rr_inflight_[idx].store(false, std::memory_order_release); }
 
     // Observability / tests.
     int64_t folded() const { return folded_.load(std::memory_order_acquire); }
@@ -387,8 +380,6 @@ private:
         synced_{}; // per member: client's model of its commit_lsn (>= L)
     std::array< std::atomic< bool >, k_max_members >
         ka_inflight_{}; // per member: a keep_alive is outstanding (the one-per-leg collapse)
-    std::array< std::atomic< bool >, k_max_members >
-        rr_inflight_{}; // per member: a request_resolution is outstanding (same collapse)
 
     std::mutex pending_mu_;                       // guards pending_
     std::vector< pending_miss > pending_;         // durable non-universal completed slots awaiting fold

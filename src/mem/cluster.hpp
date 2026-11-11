@@ -159,6 +159,8 @@ public:
     void set_op_timeout(std::chrono::milliseconds t);
 
 private:
+    // Leader resolution step over the live set, shared by run_login and run_resolution (see cluster.cpp).
+    static void resolve_slots_upto(std::vector< MemCraftReplica* > const& live, int64_t upto);
     // What a suspended op resumes on. Single-shot and completed from a service thread; the awaiting
     // coroutine resumes there, which is why nothing here may hold mu_ across a co_await.
     using sleep_event = sisl::async::shared_awaitable< std::monostate >;
