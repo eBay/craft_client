@@ -16,6 +16,7 @@
 #include "net/async_conn.hpp"
 #include "net/auth_client.hpp"
 
+#include <algorithm>
 #include <cerrno>
 #include <cstring>
 #include <utility>
@@ -141,9 +142,15 @@ sisl::async::light_task< int > craft_async_conn::ring_send_all(std::span< uint8_
     std::size_t off = 0;
     while (off < data.size()) {
         sisl::async::cqe_awaitable ev;
+        std::size_t len = data.size() - off;
+        if (send_fault_) {
+            long const f = send_fault_(off, len);
+            if (f < 0) co_return static_cast< int >(f);
+            if (f > 0) len = std::min(len, static_cast< std::size_t >(f));
+        }
         auto* sqe = acquire_sqe();
         if (nullptr == sqe) co_return -EAGAIN;
-        ::io_uring_prep_send(sqe, fd_, data.data() + off, data.size() - off, MSG_NOSIGNAL);
+        ::io_uring_prep_send(sqe, fd_, data.data() + off, len, MSG_NOSIGNAL);
         ::io_uring_sqe_set_data64(sqe, sisl::async::encode_managed_user_data(&ev));
         int const n = co_await ev;
         if (n <= 0) co_return (n == 0 ? -EPIPE : n); // 0 = peer closed; <0 = error

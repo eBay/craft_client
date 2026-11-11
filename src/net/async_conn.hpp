@@ -33,6 +33,7 @@
 #include <coroutine>
 #include <cstdint>
 #include <expected>
+#include <functional>
 #include <optional>
 #include <span>
 #include <string>
@@ -91,6 +92,14 @@ public:
     bool ready() const noexcept { return ready_; }
     // The status of the HELO that failed ensure_ready with net_error::helo_rejected.
     wire::status helo_rejection() const noexcept { return helo_rejection_; }
+
+    // Test seam for deterministic send faults: consulted before every send SQE with the bytes of the current frame
+    // already sent and still to send. 0 = send normally; > 0 = send at most that many bytes this time (a real partial
+    // send on the socket); < 0 = fail this send with that -errno, sending nothing. Unset in production.
+    using send_fault_fn = std::function< long(std::size_t sent, std::size_t remaining) >;
+    void set_send_fault_for_test(send_fault_fn f) { send_fault_ = std::move(f); }
+    // Test seam: behave as if a reconnect had opened a newer socket (socket() bumps this), leaving the current one.
+    void bump_conn_gen_for_test() noexcept { ++conn_gen_; }
 
     // Stop the pump, close the fd, and fail every pending leg. The CALLER must have quiesced the ring (no SQE of
     // ours left un-reaped) before this destroys the pump frame -- same rule as ublkpp's queue_service dtor: the
@@ -174,7 +183,8 @@ private:
     wire::status helo_rejection_{wire::status::ok}; // the last attempt's HELO refusal, ok if none
     uint64_t helo_rejected_term_{0};
     int fd_{-1};
-    uint64_t conn_gen_{0}; // bumped for every new socket: a stale op's teardown must not close a newer one
+    uint64_t conn_gen_{0};     // bumped for every new socket: a stale op's teardown must not close a newer one
+    send_fault_fn send_fault_; // test seam only (set_send_fault_for_test)
     bool ready_{false};
     bool stopping_{false};
     bool connecting_{false};
