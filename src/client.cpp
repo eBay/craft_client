@@ -229,52 +229,11 @@ async_result< size_t > craft_client::write(::io_uring* q, uint64_t addr, uint64_
     bool const provably_empty = (refused == replicas_.size());
     tracker_->resolve(dlsn, provably_empty ? slot_outcome::empty : slot_outcome::failed);
     maybe_fold();
-    // A failed (sub-quorum, not provably-absent) slot pins the frontier until the leader fills or Empties it:
-    // request the resolution round NOW (the design's client-request SyncRSCommitLSN trigger) instead of
-    // waiting for a watchdog / periodic cadence that the client cannot see.
-    if (!provably_empty) request_resolution_round(q, dlsn);
+    // A failed (sub-quorum, not provably-absent) slot pins the frontier. It is NOT resolved during the session:
+    // the application gets the error (XFS then goes offline and the volume detaches), and the next login
+    // resolves the slot under the login fence -- filled from a holder or declared Empty (HomeBlocks
+    // docs/craft/resync.md §4.4). Overlapping reads keep being served as of just before the slot meanwhile.
     co_return std::unexpected(last_err ? last_err : make_error_condition(craft_error::NO_QUORUM));
-}
-
-// One detached resolution leg to member `idx` -- fire-and-forget, like fire_keepalive: it captures the
-// tracker/route shared_ptrs and the backend by value, never the client. It drains the want watermark: a burst
-// of failed writes collapses into this one outstanding request per peer, and a want that lands while the
-// leader is resolving is picked up by the next loop pass. A member that is NOT the leader answers NOT_LEADER
-// and the leg simply ends, LEAVING the want set -- only the leader's leg (whichever member that currently is)
-// resolves and consumes it. On success the covered slots are retired off the verdicts: Empty ones as Empty,
-// filled ones as acked with the router told first (note_filled) so reads route only to certain holders until
-// the commit_lsn certificates catch up. A leg that errors (member down, deposed term) also just ends: the
-// slot stays pinned and the next failed write re-fires the legs.
-static async_status fire_resolution(::io_uring* q, std::shared_ptr< craft_replica > h, std::size_t idx, uint64_t term,
-                                    std::shared_ptr< dlsn_tracker > tracker, std::shared_ptr< read_route_map > route) {
-    for (;;) {
-        while (auto const want = tracker->resolution_want()) {
-            client_hdr const hdr{term, tracker->frontier(), route->all_committed()};
-            auto r = co_await h->request_resolution(q, hdr, *want);
-            if (!r.has_value()) { // NOT_LEADER / down / stale: this peer cannot resolve; leave the want alone
-                route->end_resolution(idx);
-                co_return ok();
-            }
-            tracker->retire_upto(r->resolved_upto, r->empty_slots, [&](int64_t d) { route->note_filled(d, idx); });
-            tracker->clear_resolution_want(r->resolved_upto);
-        }
-        route->end_resolution(idx);
-        // Close the note-then-begin race: a want recorded between our last peek and the flag release would
-        // strand until the next failure. Reclaim this peer's flag only if a want is actually pending.
-        if (!tracker->resolution_want() || !route->try_begin_resolution(idx)) co_return ok();
-    }
-}
-
-void craft_client::request_resolution_round(::io_uring* q, int64_t upto) {
-    tracker_->note_resolution_want(upto);
-    // BROADCAST, not a leader walk: the client learned the leader at login and leadership may have moved
-    // since -- mid-session it cannot know who leads. Every member gets the request, at most one outstanding
-    // per peer (the keep_alive collapse); whichever member IS the leader runs the round, the rest answer
-    // NOT_LEADER (a real replica may instead forward to its leader -- either way the client need not know).
-    // Each leg rides the failing write's ring, so its resumptions stay on that queue's reap thread.
-    for (std::size_t m = 0; m < replicas_.size(); ++m) {
-        if (route_->try_begin_resolution(m)) fire_resolution(q, replicas_[m], m, term_, tracker_, route_).detach();
-    }
 }
 
 // Issue a whole read plan to one target, filling `dest` in place; resolves to the target's piggybacked

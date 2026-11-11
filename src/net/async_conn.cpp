@@ -16,6 +16,7 @@
 #include "net/async_conn.hpp"
 #include "net/auth_client.hpp"
 
+#include <algorithm>
 #include <cerrno>
 #include <cstring>
 #include <utility>
@@ -66,14 +67,16 @@ void craft_async_conn::drop_fd() noexcept {
     ready_ = false;
 }
 
-void craft_async_conn::release_send() noexcept {
+void craft_async_conn::release_send(uint64_t epoch) noexcept {
+    if (epoch != send_epoch_) return; // fail_all() took the slot back meanwhile: it is not ours to release
     if (send_waiters_.empty()) {
         sending_ = false;
         return;
     }
-    auto const h = send_waiters_.front();
-    send_waiters_.erase(send_waiters_.begin()); // FIFO; sending_ STAYS true -- the slot is handed to h
-    if (h) h.resume();
+    auto const w = send_waiters_.front();
+    send_waiters_.erase(send_waiters_.begin()); // FIFO; sending_ STAYS true -- the slot is handed to w
+    *w.granted = true;
+    if (w.h) w.h.resume();
 }
 
 void craft_async_conn::fail_all() noexcept {
@@ -85,14 +88,16 @@ void craft_async_conn::fail_all() noexcept {
         slot->ready = true;
         if (slot->waiter) slot->waiter.resume();
     }
-    // Ops parked for the send slot must unwind too: their reply_slots are already flagged failed above, so once
-    // resumed they send on the (now dead) fd, fall through the failed reply, and return an error. Resume after the
-    // reply-waiters so none observes a half-torn-down state.
+    // Ops parked for the send slot must unwind too. They resume WITHOUT the slot (granted stays false) and return an
+    // error without sending. The slot itself is freed by force; advancing the epoch makes its current owner's late
+    // release_send a no-op (see send_awaitable). Resume after the reply-waiters so none observes a half-torn-down
+    // state.
     sending_ = false;
+    ++send_epoch_;
     auto sw = std::move(send_waiters_);
     send_waiters_.clear();
-    for (auto const h : sw)
-        if (h) h.resume();
+    for (auto const& w : sw)
+        if (w.h) w.h.resume();
 }
 
 void craft_async_conn::shutdown() noexcept {
@@ -116,6 +121,7 @@ void craft_async_conn::shutdown() noexcept {
 
 sisl::async::light_task< int > craft_async_conn::ring_connect() {
     fd_ = ::socket(AF_INET, SOCK_STREAM, 0);
+    ++conn_gen_;
     if (fd_ >= 0) { // see set_nodelay in conn.cpp: CRAFT is request/response, so Nagle only ever adds latency
         int const one = 1;
         ::setsockopt(fd_, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
@@ -140,9 +146,15 @@ sisl::async::light_task< int > craft_async_conn::ring_send_all(std::span< uint8_
     std::size_t off = 0;
     while (off < data.size()) {
         sisl::async::cqe_awaitable ev;
+        std::size_t len = data.size() - off;
+        if (send_fault_) {
+            long const f = send_fault_(off, len);
+            if (f < 0) co_return static_cast< int >(f);
+            if (f > 0) len = std::min(len, static_cast< std::size_t >(f));
+        }
         auto* sqe = acquire_sqe();
         if (nullptr == sqe) co_return -EAGAIN;
-        ::io_uring_prep_send(sqe, fd_, data.data() + off, data.size() - off, MSG_NOSIGNAL);
+        ::io_uring_prep_send(sqe, fd_, data.data() + off, len, MSG_NOSIGNAL);
         ::io_uring_sqe_set_data64(sqe, sisl::async::encode_managed_user_data(&ev));
         int const n = co_await ev;
         if (n <= 0) co_return (n == 0 ? -EPIPE : n); // 0 = peer closed; <0 = error
@@ -224,13 +236,29 @@ craft_async_conn::round_trip(wire::op o, std::span< uint8_t const > op_hdr, std:
 
     // Hold the wire's send slot for the WHOLE of this message so its bytes are contiguous on the socket, then
     // release before waiting for the reply (the next op sends while we wait; replies demux by request_id).
-    co_await send_awaitable{this};
-    int const sr = co_await ring_send_all(out);
-    release_send();
-    if (sr < 0) {
+    if (!co_await send_awaitable{this}) {
+        // Woken by fail_all() without the slot: the connection went down while we queued. Nothing was sent, so this
+        // is a send failure -- provably never delivered -- not `closed` (delivery uncertain).
         pending_.erase(rid);
         co_return std::unexpected(net_error::send);
     }
+    uint64_t const epoch = send_epoch_; // our ownership of the send slot
+    uint64_t const gen = conn_gen_;     // the connection this frame goes out on
+    int const sr = co_await ring_send_all(out);
+    if (sr < 0) {
+        // The frame may be PARTIALLY on the socket (ring_send_all stops after a short send that errors, or when no
+        // SQE is free). Keeping the connection would let the next message's bytes follow the fragment, so the server
+        // could parse a frame whose payload mixes the two, and the caller would report it as "never delivered"
+        // (REPLICA_DOWN). Drop the socket BEFORE handing the send slot on: the pump sees the close and fails every
+        // other pending op, a send already queued behind us fails on the dead fd, and the next op reconnects.
+        // Only if this is still the connection we sent on: a stale send's late failure must never close a newer
+        // socket that a reconnect opened meanwhile.
+        pending_.erase(rid);
+        if (gen == conn_gen_) drop_fd();
+        release_send(epoch);
+        co_return std::unexpected(net_error::send);
+    }
+    release_send(epoch);
 
     co_await reply_awaitable{&slot}; // the pump fills slot + resumes us (or fail_all does, with failed=true)
     pending_.erase(rid);             // defensive: the pump already erased on delivery

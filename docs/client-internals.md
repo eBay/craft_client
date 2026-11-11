@@ -115,22 +115,13 @@ holds the slot, it is a permanent no-op, and the frontier may pass over it. A su
 degrades to `failed`. Counting a timeout here would advance `F` past a dLSN a peer later applies, which is
 divergence. In every other respect all non-acks are equal.
 
-A `failed` outcome no longer waits for the next login: it fires the **client-requested resolution round**
-(`craft_replica::request_resolution`, the design's client-request `SyncRSCommitLSN` trigger). The client
-cannot know who the leader is mid-session (it learned one at login; leadership may have moved), so the
-request is **broadcast to every member** as detached fire-and-forget legs, with at most **one outstanding per
-peer** -- exactly the keep_alive collapse (`rr_inflight_` beside `ka_inflight_`), so a burst of failed
-in-flight writes collapses into the pending legs rather than one request per failure. The failed dLSNs
-CAS-max into a single *want* watermark (`dlsn_tracker`); whichever member is the current leader resolves
-every unresolved slot <= the want -- fills it from a holder (the failed write completes late) or verdicts it
-Empty on quorum-lacks evidence -- while non-leaders answer `NOT_LEADER` and leave the want untouched (only a
-successful round consumes it). The client retires the covered slots off the reply
-(`dlsn_tracker::retire_upto`): Empty verdicts resolve `empty`, filled slots resolve `acked` with the router
-told first (`note_filled`: the slot becomes verdict-durable and reads route only to its certain holders until
-the commit certificates catch up). A replica REJECTS a late arrival into an Empty-verdicted slot, so a write
-the round voided fails deterministically on its own ack path -- the verdict and the client's local `Empty`
-conclusion agree. If no leg can resolve (leader down), the slot simply stays pinned and the next failed write
-re-fires the legs.
+A `failed` outcome is **resolved at the next login, not during the session**. The application gets the error (in
+production XFS then goes offline and the volume is detached), the failed slot pins the frontier `F`, and reads that
+overlap it keep being served as of just before it (see *Why per-block*). The client sends no resolution request.
+The next login decides the slot under the login fence: if a live member holds it, it is filled everywhere (the
+write completed late); if nobody holds it, the login's starting point is below it and the dLSN is simply reused.
+The `request_resolution` verb and the wire `resolve` op still exist for compatibility but are no longer used by
+the client. Background: HomeBlocks `docs/craft/resync.md` §4.4-§4.5 (mid-session verdicts raced in-flight acks).
 
 ### Where a write actually goes
 
@@ -396,8 +387,8 @@ Also outstanding, in rough order:
 
 - the server-side **watchdog** the keep_alive drive is meant to reset (a deferred seam today,
   `mem_craft_replica.cpp`), and server-side **resync** (`SyncRSCommitLSN`) that makes the recovery erase above
-  effective -- both are server/peer concerns, not client work (the client-REQUESTED resolution round and its
-  retire path now exist: `request_resolution` / `retire_upto`, see *A non-ack is not one thing*);
+  effective -- both are server/peer concerns, not client work (failed writes are resolved at the next login,
+  see *A non-ack is not one thing*);
 - re-login on `STALE_TERM`;
 - the client-side all-zero scan that picks the CRAFT zero-write form (the server does not re-scan a data
   write), plus ublk `DISCARD` / `WRITE_ZEROES` → a CRAFT zero write (empty `sg_list`);

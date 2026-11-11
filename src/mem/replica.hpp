@@ -91,6 +91,8 @@ struct replica_stats {
     std::vector< int64_t > missing_sample; // ascending, capped at k_missing_sample
 
     std::size_t mapped_blocks{0}; // index_.size(); coverage of the applied prefix
+
+    uint64_t stale_term_writes{0}; // writes rejected for carrying another session's term (e.g. a late old-session one)
 };
 
 // One replica's fault/latency knobs, in an immutable snapshot the IO path reads with a single acquire load
@@ -276,6 +278,7 @@ private:
 
 protected:
     virtual void on_state_changed() {} // called under mu_ after every state_ mutation; override to persist
+    void cold_fence(uint64_t term);    // login fence: reject the old session's writes before the poll
     void cold_apply_login(uint64_t client_token, uint64_t term);
     void cold_truncate_above(int64_t rs_commit_lsn);
     void cold_install_slot(int64_t dlsn, MemJournalSlot s); // fill a hole; never overwrites an entry
@@ -299,6 +302,7 @@ protected:
     std::shared_ptr< MemTransport > net_;
 
     CraftPartitionState state_;
+    uint64_t stale_term_writes_{0}; // guarded by mu_; reported in stats()
     // shared_ptr for restart support using registry_manager.
     std::shared_ptr< journal_t > journal_; // dLSN -> slot (out-of-order arrival tolerated)
     std::shared_ptr< index_t > index_;     // applied prefix (<= commit_lsn); an absent LBA is a hole

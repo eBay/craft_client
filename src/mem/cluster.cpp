@@ -335,50 +335,12 @@ std::vector< MemCraftReplica* > MemTransport::live_replicas_locked() const {
     return live;
 }
 
-result< LoginResult > MemTransport::run_login(MemCraftReplica* caller, uint64_t client_token) {
-    std::vector< MemCraftReplica* > live;
-    std::vector< replica_endpoint > members_copy;
-    uint64_t nt{0};
-    {
-        std::lock_guard< std::mutex > g{mu_};
-        if (!caller->is_up()) return fail(craft_error::REPLICA_DOWN);              // the caller's own lock-free knob
-        if (caller->id() != leader_) return LoginResult{{}, -1, 0, 0, 0, leader_}; // redirect: geometry unknown
-        live = live_replicas_locked();
-        if (live.size() < quorum(members_.size())) return fail(craft_error::NO_QUORUM);
-        nt = ++term_;
-        members_copy = members_;
-    }
-    // Drive the cold path WITHOUT holding mu_ (each replica call takes only its own lock).
-    // Phase 1: GetRSCommitLSN -> rs_commit_lsn = max(quorum.last_append_lsn).
-    int64_t rs = -1;
-    for (auto* r : live)
-        rs = std::max(rs, r->peek_lsns().last_append_lsn);
-    // Phase 2: SyncRSCommitLSN(rs) applied to all live members.
-    for (auto* r : live)
-        r->cold_apply_sync(rs, client_token);
-    // Phase 3: InternalLogin(token, term+1) applied to all live members.
-    for (auto* r : live)
-        r->cold_apply_login(client_token, nt);
-    // Phase 4: truncate any stale tail above rs.
-    for (auto* r : live) {
-        if (r->peek_lsns().last_append_lsn > rs) r->cold_truncate_above(rs);
-    }
-    LoginResult lr{std::move(members_copy), rs, nt, lba_size_, capacity_};
-    lr.max_tx = max_tx_; // convey the volume max transfer once, like lba_size / capacity
-    return lr;
-}
-
-result< resolution_result > MemTransport::run_resolution(MemCraftReplica* caller, uint64_t term, int64_t upto) {
-    std::vector< MemCraftReplica* > live;
-    {
-        std::lock_guard< std::mutex > g{mu_};
-        if (!caller->is_up()) return fail(craft_error::REPLICA_DOWN);
-        if (caller->id() != leader_) return fail(craft_error::NOT_LEADER);
-        if (term != term_) return fail(craft_error::STALE_TERM); // fence a deposed client's round
-        live = live_replicas_locked();
-        if (live.size() < quorum(members_.size())) return fail(craft_error::NO_QUORUM);
-    }
-
+// The leader's resolution step over the live set (a quorum), shared by login and the resolution round: every
+// slot <= upto that is not yet contiguously present everywhere is filled from a live holder, or -- when the whole
+// live set lacks it, or a prior Empty verdict exists -- verdicted Empty everywhere. Run by login under the
+// session switch, this is where a failed (sub-quorum) write is resolved: it completes late if any live member
+// holds it, and is voided otherwise (HomeBlocks docs/craft/resync.md §4.4).
+void MemTransport::resolve_slots_upto(std::vector< MemCraftReplica* > const& live, int64_t upto) {
     // Everything <= a member's commit_lsn is contiguously present there, so the min over the live set bounds
     // the scan: below it nothing can be unresolved.
     int64_t floor = std::numeric_limits< int64_t >::max();
@@ -409,6 +371,64 @@ result< resolution_result > MemTransport::run_resolution(MemCraftReplica* caller
             }
         }
     }
+}
+
+result< LoginResult > MemTransport::run_login(MemCraftReplica* caller, uint64_t client_token) {
+    std::vector< MemCraftReplica* > live;
+    std::vector< replica_endpoint > members_copy;
+    uint64_t nt{0};
+    {
+        std::lock_guard< std::mutex > g{mu_};
+        if (!caller->is_up()) return fail(craft_error::REPLICA_DOWN);              // the caller's own lock-free knob
+        if (caller->id() != leader_) return LoginResult{{}, -1, 0, 0, 0, leader_}; // redirect: geometry unknown
+        live = live_replicas_locked();
+        if (live.size() < quorum(members_.size())) return fail(craft_error::NO_QUORUM);
+        nt = ++term_;
+        members_copy = members_;
+    }
+    // Drive the cold path WITHOUT holding mu_ (each replica call takes only its own lock).
+    // Phase 0: fence. Every live replica switches to the new term BEFORE it is polled, so from here on it rejects
+    // the old session's writes: none can reach quorum after the absence scan below and then be voided by it. In
+    // this model a write is applied atomically under the replica's lock, so there is no admitted-but-unfinished
+    // write to drain; a delayed delivery that arrives later carries the old term and is rejected. Nobody writes
+    // under the new term until this login returns, so the early switch admits no one.
+    for (auto* r : live)
+        r->cold_fence(nt);
+    // Phase 1: GetRSCommitLSN -> rs_commit_lsn = max(quorum.last_append_lsn).
+    int64_t rs = -1;
+    for (auto* r : live)
+        rs = std::max(rs, r->peek_lsns().last_append_lsn);
+    if (login_poll_hook_) login_poll_hook_();
+    // Phase 1b: resolve every unresolved slot <= rs (fill from a holder, or verdict Empty) -- failed writes of the
+    // previous session are decided here, not mid-session.
+    resolve_slots_upto(live, rs);
+    // Phase 2: SyncRSCommitLSN(rs) applied to all live members.
+    for (auto* r : live)
+        r->cold_apply_sync(rs, client_token);
+    // Phase 3: InternalLogin(token, term+1) applied to all live members.
+    for (auto* r : live)
+        r->cold_apply_login(client_token, nt);
+    // Phase 4: truncate any stale tail above rs.
+    for (auto* r : live) {
+        if (r->peek_lsns().last_append_lsn > rs) r->cold_truncate_above(rs);
+    }
+    LoginResult lr{std::move(members_copy), rs, nt, lba_size_, capacity_};
+    lr.max_tx = max_tx_; // convey the volume max transfer once, like lba_size / capacity
+    return lr;
+}
+
+result< resolution_result > MemTransport::run_resolution(MemCraftReplica* caller, uint64_t term, int64_t upto) {
+    std::vector< MemCraftReplica* > live;
+    {
+        std::lock_guard< std::mutex > g{mu_};
+        if (!caller->is_up()) return fail(craft_error::REPLICA_DOWN);
+        if (caller->id() != leader_) return fail(craft_error::NOT_LEADER);
+        if (term != term_) return fail(craft_error::STALE_TERM); // fence a deposed client's round
+        live = live_replicas_locked();
+        if (live.size() < quorum(members_.size())) return fail(craft_error::NO_QUORUM);
+    }
+
+    resolve_slots_upto(live, upto);
     for (auto* r : live)
         r->cold_apply_sync(upto, 0);
 
