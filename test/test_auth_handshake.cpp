@@ -657,3 +657,47 @@ TEST(CraftAuthHandshake, OnRingStaleSendFailureLeavesTheNewConnection) {
     replica.join();
     EXPECT_EQ(replica.accepted(), 1) << "no reconnect";
 }
+
+// The send slot survives a teardown it raced with: frame A is mid-send when a recv fault fails everything
+// (fail_all frees the slot) and a reconnect opens a newer socket; frame B takes the free slot and starts sending.
+// A's send then fails late. A's release must NOT free B's slot -- a third frame C would otherwise start sending
+// while B is still on the socket, interleaving the two (review on craft_client #6).
+TEST(CraftAuthHandshake, OnRingStaleSendCannotReleaseANewerFramesSlot) {
+    auto rs = replica_script{};
+    rs.enforce = false;
+    rs.connections = 2;
+    scripted_replica replica{rs};
+    {
+        ring_session ring{replica.port(), std::nullopt};
+        ASSERT_TRUE(ring.ready().has_value());
+
+        auto* conn = ring.conn.get();
+        auto b = std::make_shared< ka_result >();
+        int calls = 0;
+        ring.conn->set_send_fault_for_test([&, conn, b](std::size_t, std::size_t) -> long {
+            if (++calls != 1) return 0; // B and C send normally
+            // A's first send: the connection is torn down and replaced under it, and B takes the freed slot.
+            conn->fail_all_for_test();
+            conn->bump_conn_gen_for_test();
+            issue_conn_keep_alive(conn, b).detach(); // acquires the slot, submits its send (call 2), suspends
+            return -EIO;                             // ...and A's send fails late
+        });
+        auto a = std::make_shared< ka_result >();
+        issue_conn_keep_alive(ring.conn.get(), a).detach();
+        ASSERT_TRUE(a->has_value());
+        ASSERT_FALSE(a->value().has_value());
+        EXPECT_EQ(a->value().error(), net::net_error::send);
+        ASSERT_EQ(calls, 2);
+
+        auto c = std::make_shared< ka_result >();
+        issue_conn_keep_alive(ring.conn.get(), c).detach();
+        EXPECT_EQ(calls, 2) << "C must wait for B's slot, not send next to it";
+
+        ASSERT_TRUE(ring.driver.drive_until([&] { return b->has_value() && c->has_value(); }));
+        EXPECT_TRUE(b->value().has_value());
+        EXPECT_TRUE(c->value().has_value());
+        EXPECT_EQ(calls, 3);
+        ring.driver.drain_for(std::chrono::milliseconds{50});
+    }
+    replica.join();
+}

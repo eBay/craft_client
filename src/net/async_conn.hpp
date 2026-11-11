@@ -100,6 +100,8 @@ public:
     void set_send_fault_for_test(send_fault_fn f) { send_fault_ = std::move(f); }
     // Test seam: behave as if a reconnect had opened a newer socket (socket() bumps this), leaving the current one.
     void bump_conn_gen_for_test() noexcept { ++conn_gen_; }
+    // Test seam: the teardown a recv fault runs (fail every pending op, free the send slot by force).
+    void fail_all_for_test() noexcept { fail_all(); }
 
     // Stop the pump, close the fd, and fail every pending leg. The CALLER must have quiesced the ring (no SQE of
     // ours left un-reaped) before this destroys the pump frame -- same rule as ublkpp's queue_service dtor: the
@@ -136,19 +138,31 @@ private:
     // next op's bytes land BETWEEN the chunks -- corrupting the stream so the peer resets the connection. This
     // gates only sending; reply-waits still overlap freely (they demux by request_id). Acquire the slot in
     // await_ready when free, else park; release_send() hands it to the next waiter.
+    //
+    // Ownership is explicit: co_await yields true only to an op that now OWNS the slot (taken free, or handed to it
+    // by release_send), together with the slot's epoch. fail_all() frees the slot by force -- its owner may still have
+    // a send in flight on the dead socket -- and advances the epoch, so that owner's late release_send(epoch) is a
+    // no-op instead of releasing a slot a newer frame owns by then (two frames would then interleave). Ops fail_all
+    // wakes up from the queue resume with false: they own nothing and must not send.
+    struct send_waiter {
+        std::coroutine_handle<> h;
+        bool* granted;
+    };
     struct send_awaitable {
         craft_async_conn* c;
-        bool await_ready() const noexcept {
+        bool granted{false};
+        bool await_ready() noexcept {
             if (!c->sending_) {
                 c->sending_ = true;
+                granted = true;
                 return true;
             }
             return false;
         }
-        void await_suspend(std::coroutine_handle<> h) noexcept { c->send_waiters_.push_back(h); }
-        void await_resume() const noexcept {}
+        void await_suspend(std::coroutine_handle<> h) noexcept { c->send_waiters_.push_back({h, &granted}); }
+        bool await_resume() const noexcept { return granted; }
     };
-    void release_send() noexcept; // hand the send slot to the next parked op, or free it
+    void release_send(uint64_t epoch) noexcept; // hand the slot to the next parked op, or free it (if still ours)
 
     // Frame `op_hdr` + `body` as `o` at a fresh request_id, send it on the ring, and await the reply via the
     // pump. Returns the raw reply message bytes (the caller decodes the typed rsp), or a net_error.
@@ -190,7 +204,8 @@ private:
     bool connecting_{false};
     std::vector< std::coroutine_handle<> > connect_waiters_; // ops parked while the first connects
     bool sending_{false};
-    std::vector< std::coroutine_handle<> > send_waiters_; // ops parked while another holds the send slot
+    std::vector< send_waiter > send_waiters_; // ops parked while another holds the send slot
+    uint64_t send_epoch_{0};                  // advanced by fail_all(): a release from before it is stale
 
     std::vector< uint8_t > rx_; // recv accumulation across message boundaries
 

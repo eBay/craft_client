@@ -67,14 +67,16 @@ void craft_async_conn::drop_fd() noexcept {
     ready_ = false;
 }
 
-void craft_async_conn::release_send() noexcept {
+void craft_async_conn::release_send(uint64_t epoch) noexcept {
+    if (epoch != send_epoch_) return; // fail_all() took the slot back meanwhile: it is not ours to release
     if (send_waiters_.empty()) {
         sending_ = false;
         return;
     }
-    auto const h = send_waiters_.front();
-    send_waiters_.erase(send_waiters_.begin()); // FIFO; sending_ STAYS true -- the slot is handed to h
-    if (h) h.resume();
+    auto const w = send_waiters_.front();
+    send_waiters_.erase(send_waiters_.begin()); // FIFO; sending_ STAYS true -- the slot is handed to w
+    *w.granted = true;
+    if (w.h) w.h.resume();
 }
 
 void craft_async_conn::fail_all() noexcept {
@@ -86,14 +88,16 @@ void craft_async_conn::fail_all() noexcept {
         slot->ready = true;
         if (slot->waiter) slot->waiter.resume();
     }
-    // Ops parked for the send slot must unwind too: their reply_slots are already flagged failed above, so once
-    // resumed they send on the (now dead) fd, fall through the failed reply, and return an error. Resume after the
-    // reply-waiters so none observes a half-torn-down state.
+    // Ops parked for the send slot must unwind too. They resume WITHOUT the slot (granted stays false) and return an
+    // error without sending. The slot itself is freed by force; advancing the epoch makes its current owner's late
+    // release_send a no-op (see send_awaitable). Resume after the reply-waiters so none observes a half-torn-down
+    // state.
     sending_ = false;
+    ++send_epoch_;
     auto sw = std::move(send_waiters_);
     send_waiters_.clear();
-    for (auto const h : sw)
-        if (h) h.resume();
+    for (auto const& w : sw)
+        if (w.h) w.h.resume();
 }
 
 void craft_async_conn::shutdown() noexcept {
@@ -232,8 +236,13 @@ craft_async_conn::round_trip(wire::op o, std::span< uint8_t const > op_hdr, std:
 
     // Hold the wire's send slot for the WHOLE of this message so its bytes are contiguous on the socket, then
     // release before waiting for the reply (the next op sends while we wait; replies demux by request_id).
-    co_await send_awaitable{this};
-    uint64_t const gen = conn_gen_; // the connection this frame goes out on
+    if (!co_await send_awaitable{this}) {
+        // Woken by fail_all() without the slot: the connection went down while we queued. Nothing was sent.
+        pending_.erase(rid);
+        co_return std::unexpected(net_error::closed);
+    }
+    uint64_t const epoch = send_epoch_; // our ownership of the send slot
+    uint64_t const gen = conn_gen_;     // the connection this frame goes out on
     int const sr = co_await ring_send_all(out);
     if (sr < 0) {
         // The frame may be PARTIALLY on the socket (ring_send_all stops after a short send that errors, or when no
@@ -245,10 +254,10 @@ craft_async_conn::round_trip(wire::op o, std::span< uint8_t const > op_hdr, std:
         // socket that a reconnect opened meanwhile.
         pending_.erase(rid);
         if (gen == conn_gen_) drop_fd();
-        release_send();
+        release_send(epoch);
         co_return std::unexpected(net_error::send);
     }
-    release_send();
+    release_send(epoch);
 
     co_await reply_awaitable{&slot}; // the pump fills slot + resumes us (or fail_all does, with failed=true)
     pending_.erase(rid);             // defensive: the pump already erased on delivery
