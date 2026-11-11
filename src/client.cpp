@@ -183,7 +183,6 @@ async_result< size_t > craft_client::write(::io_uring* q, uint64_t addr, uint64_
     // then reads the highest reserved dLSN J, so every dLSN above J is sent to the new backend.
     auto const ms = members_.load(std::memory_order_seq_cst); // seq_cst: see dlsn_tracker::reserve()
     auto const& replicas = ms->backends;
-    kick_resolution_handoffs(q, ms); // a want left pending by a member swap (write-only queues need this too)
 
     // Ack at quorum, not at the slowest replica: a straggler must not cost every write the transport's timeout.
     // Stragglers keep running detached, so each replica op must have consumed `data` by its first suspension
@@ -239,10 +238,10 @@ async_result< size_t > craft_client::write(::io_uring* q, uint64_t addr, uint64_
     bool const provably_empty = (refused == replicas.size());
     tracker_->resolve(dlsn, provably_empty ? slot_outcome::empty : slot_outcome::failed);
     maybe_fold();
-    // A failed (sub-quorum, not provably-absent) slot pins the frontier until the leader fills or Empties it:
-    // request the resolution round NOW (the design's client-request SyncRSCommitLSN trigger) instead of
-    // waiting for a watchdog / periodic cadence that the client cannot see.
-    if (!provably_empty) request_resolution_round(q, dlsn);
+    // A failed (sub-quorum, not provably-absent) slot pins the frontier. It is NOT resolved during the session:
+    // the application gets the error (XFS then goes offline and the volume detaches), and the next login
+    // resolves the slot under the login fence -- filled from a holder or declared Empty (HomeBlocks
+    // docs/craft/resync.md §4.4). Overlapping reads keep being served as of just before the slot meanwhile.
     co_return std::unexpected(last_err ? last_err : make_error_condition(craft_error::NO_QUORUM));
 }
 
@@ -277,70 +276,7 @@ std::error_condition craft_client::replace_member(peer_id_t const& old_id, std::
     route_->begin_replace(idx, published->gens[idx]);
     members_.store(published, std::memory_order_seq_cst);
     route_->finish_replace(idx, tracker_->issued());
-    // A resolution want pending across the swap (a round that died before it, or one whose only live leg was to
-    // the old backend) must reach the new backend without waiting for another failed write: mark the slot so the
-    // next write or keep_alive drive fires it.
-    if (tracker_->resolution_want()) route_->note_resolution_handoff(idx);
     return {};
-}
-
-// One detached resolution leg to member `idx` -- fire-and-forget, like fire_keepalive: it captures the
-// tracker/route shared_ptrs and the backend by value, never the client. It drains the want watermark: a burst
-// of failed writes collapses into this one outstanding request per peer, and a want that lands while the
-// leader is resolving is picked up by the next loop pass. A member that is NOT the leader answers NOT_LEADER
-// and the leg simply ends, LEAVING the want set -- only the leader's leg (whichever member that currently is)
-// resolves and consumes it. On success the covered slots are retired off the verdicts: Empty ones as Empty,
-// filled ones as acked with the router told first (note_filled) so reads route only to certain holders until
-// the commit_lsn certificates catch up. A leg that errors (member down, deposed term) also just ends: the
-// slot stays pinned and the next failed write re-fires the legs.
-//
-// `gen` is the generation of `h` in slot `idx`. A leg whose backend has been replaced (replace_member) stops at the
-// next request instead of draining wants above the replace point against the OLD member, and note_filled does not
-// credit the new member with what the old one resolved. On EVERY exit after a replace, a want still pending is
-// handed to the slot's current backend (note_resolution_handoff; fired by the next write or keep_alive drive), so
-// it never waits for another failed write -- which may not come on a healthy cluster.
-// `client_token` goes in every request header like every other op's (make_hdr): a leg can be a fresh proxy's FIRST
-// op (a hand-off to a just-swapped backend), and its on-ring HELO presents the header's token as the session owner.
-static async_status fire_resolution(::io_uring* q, std::shared_ptr< craft_replica > h, std::size_t idx, uint64_t term,
-                                    uint64_t client_token, uint64_t gen, std::shared_ptr< dlsn_tracker > tracker,
-                                    std::shared_ptr< read_route_map > route) {
-    auto handoff_if_replaced = [&] {
-        if (route->generation(idx) != gen && tracker->resolution_want()) route->note_resolution_handoff(idx);
-    };
-    for (;;) {
-        while (auto const want = tracker->resolution_want()) {
-            if (route->generation(idx) != gen) break; // replaced: hand off below
-            client_hdr const hdr{term, tracker->frontier(), route->all_committed(), client_token};
-            auto r = co_await h->request_resolution(q, hdr, *want);
-            if (!r.has_value()) { // NOT_LEADER / down / stale: this peer cannot resolve; leave the want alone
-                route->end_resolution(idx, gen);
-                handoff_if_replaced(); // e.g. OUT, being moved away, errors after the swap
-                co_return ok();
-            }
-            tracker->retire_upto(r->resolved_upto, r->empty_slots, [&](int64_t d) { route->note_filled(d, idx, gen); });
-            tracker->clear_resolution_want(r->resolved_upto);
-        }
-        route->end_resolution(idx, gen);
-        handoff_if_replaced();
-        // Close the note-then-begin race: a want recorded between our last peek and the flag release would
-        // strand until the next failure. Reclaim this peer's flag only if a want is actually pending.
-        if (route->generation(idx) != gen || !tracker->resolution_want() || !route->try_begin_resolution(idx, gen))
-            co_return ok();
-    }
-}
-
-void craft_client::request_resolution_round(::io_uring* q, int64_t upto) {
-    tracker_->note_resolution_want(upto);
-    // BROADCAST, not a leader walk: the client learned the leader at login and leadership may have moved
-    // since -- mid-session it cannot know who leads. Every member gets the request, at most one outstanding
-    // per peer (the keep_alive collapse); whichever member IS the leader runs the round, the rest answer
-    // NOT_LEADER (a real replica may instead forward to its leader -- either way the client need not know).
-    // Each leg rides the failing write's ring, so its resumptions stay on that queue's reap thread.
-    auto const ms = members();
-    for (std::size_t m = 0; m < ms->backends.size(); ++m) {
-        if (route_->try_begin_resolution(m, ms->gens[m]))
-            fire_resolution(q, ms->backends[m], m, term_, client_token_, ms->gens[m], tracker_, route_).detach();
-    }
 }
 
 // Issue a whole read plan to one target, filling `dest` in place; resolves to the target's piggybacked
@@ -478,21 +414,6 @@ void craft_client::drive_keepalives(::io_uring* q, std::size_t exclude_idx) {
         // leg touches (advance_synced, the flag itself) is atomic/lock-guarded in the router.
         if (route_->try_begin_keepalive(m, ms->gens[m]))
             fire_keepalive(q, ms->backends[m], hdr, route_, m, ms->gens[m]).detach();
-    }
-    kick_resolution_handoffs(q, ms);
-}
-
-// Hand-off after a replace_member: a want pending across the swap marks the replaced slot (replace_member itself,
-// or a resolution leg to the slot's OLD backend on its way out). Fire that slot's CURRENT backend so the want does
-// not wait for the next failed write (which matters if the new member is the leader). Only replaced slots are
-// re-driven; any other dead round still re-fires on the next failure, as before. Called from every write and every
-// keep_alive drive, so a write-only queue picks it up too; with nothing marked it is n relaxed loads.
-void craft_client::kick_resolution_handoffs(::io_uring* q, member_set const* ms) {
-    for (std::size_t m = 0; m < n_; ++m) {
-        if (!route_->take_resolution_handoff(m)) continue;
-        if (!tracker_->resolution_want()) continue;
-        if (route_->try_begin_resolution(m, ms->gens[m]))
-            fire_resolution(q, ms->backends[m], m, term_, client_token_, ms->gens[m], tracker_, route_).detach();
     }
 }
 

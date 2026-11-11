@@ -99,12 +99,6 @@ private:
     std::optional< std::error_condition > precheck(uint64_t addr, uint64_t len) const;
     async_result< lsn_pair > issue_plan(::io_uring* q, std::shared_ptr< craft_replica > const& target, client_hdr hdr,
                                         read_plan const& plan, uint64_t addr, uint64_t len, sisl::sg_list& dest);
-    // Fire the client-requested resolution round for failed slot `upto`: record the want, then BROADCAST a
-    // detached request to every peer without one outstanding (per-peer single-flight, the keep_alive
-    // collapse) -- the client cannot know who leads mid-session, so whichever member is the leader resolves.
-    // Each leg captures the tracker's and router's shared_ptrs, never `this`; it rides the ring of the write
-    // whose failure fired it.
-    void request_resolution_round(::io_uring* q, int64_t upto);
 
     // The members, as one immutable snapshot swapped atomically by replace_member. Every op loads it ONCE and
     // drives that snapshot's backends; `gens[i]` is the generation of backends[i], carried into the router with
@@ -119,7 +113,6 @@ private:
     // is owned by member_sets_ for the client's lifetime instead (moves are rare and a set is a few pointers), so a
     // loaded pointer never dangles. Ops that outlive the client (detached legs) copy the backend shared_ptr out.
     member_set const* members() const { return members_.load(std::memory_order_acquire); }
-    void kick_resolution_handoffs(::io_uring* q, member_set const* ms);
     std::size_t const n_;      // member count: fixed for the client's life (a move replaces, never adds/removes)
     std::size_t const quorum_; // n_ / 2 + 1
     std::atomic< member_set const* > members_{nullptr};

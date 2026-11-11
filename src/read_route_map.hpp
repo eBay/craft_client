@@ -136,8 +136,6 @@ public:
             floor_[i].store(login_dlsn, std::memory_order_relaxed);  // a member serves reads once synced >= this
             synced_[i].store(k_unsynced, std::memory_order_relaxed); // raised per-member from its real commit_lsn
             ka_inflight_[i].store(0, std::memory_order_relaxed);
-            rr_inflight_[i].store(0, std::memory_order_relaxed);
-            rr_handoff_[i].store(false, std::memory_order_relaxed);
         }
         all_committed_.store(k_unsynced, std::memory_order_relaxed); // min synced_; rises as members report in
         {
@@ -389,19 +387,6 @@ public:
     bool try_begin_keepalive(std::size_t idx, uint64_t gen = 0) { return try_begin(ka_inflight_[idx], gen); }
     void end_keepalive(std::size_t idx, uint64_t gen = 0) { end(ka_inflight_[idx], gen); }
 
-    // The identical collapse for the client-requested resolution round: at most ONE outstanding
-    // request_resolution per member. A burst of failed in-flight writes tops a peer up again only once its
-    // previous request completed, never one request per failure (the want watermark in dlsn_tracker is what
-    // accumulates the burst).
-    bool try_begin_resolution(std::size_t idx, uint64_t gen = 0) { return try_begin(rr_inflight_[idx], gen); }
-    void end_resolution(std::size_t idx, uint64_t gen = 0) { end(rr_inflight_[idx], gen); }
-    // A leg to a replaced backend stopped with a resolution want still pending: the client's next keep_alive drive
-    // fires the slot's current backend (take_ clears the mark).
-    void note_resolution_handoff(std::size_t idx) { rr_handoff_[idx].store(true, std::memory_order_release); }
-    bool take_resolution_handoff(std::size_t idx) {
-        return rr_handoff_[idx].load(std::memory_order_acquire) &&
-            rr_handoff_[idx].exchange(false, std::memory_order_acq_rel);
-    }
 
     // Observability / tests.
     int64_t folded() const { return folded_.load(std::memory_order_acquire); }
@@ -459,11 +444,6 @@ private:
     // Per member: 0 = free, else (generation + 1) of the backend whose leg is outstanding.
     std::array< std::atomic< uint64_t >, k_max_members >
         ka_inflight_{}; // per member: a keep_alive is outstanding (the one-per-leg collapse)
-    std::array< std::atomic< uint64_t >, k_max_members >
-        rr_inflight_{}; // per member: a request_resolution is outstanding (same collapse)
-    std::array< std::atomic< bool >, k_max_members >
-        rr_handoff_{}; // per member: a replaced backend's leg left a want for the current backend
-
     // Take the gate for generation `gen`: free, or held by an OLDER generation (a replaced backend's leg).
     static bool try_begin(std::atomic< uint64_t >& g, uint64_t gen) {
         uint64_t const mine = gen + 1;

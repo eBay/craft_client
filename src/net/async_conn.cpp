@@ -226,11 +226,18 @@ craft_async_conn::round_trip(wire::op o, std::span< uint8_t const > op_hdr, std:
     // release before waiting for the reply (the next op sends while we wait; replies demux by request_id).
     co_await send_awaitable{this};
     int const sr = co_await ring_send_all(out);
-    release_send();
     if (sr < 0) {
+        // The frame may be PARTIALLY on the socket (ring_send_all stops after a short send that errors, or when no
+        // SQE is free). Keeping the connection would let the next message's bytes follow the fragment, so the server
+        // could parse a frame whose payload mixes the two, and the caller would report it as "never delivered"
+        // (REPLICA_DOWN). Drop the socket BEFORE handing the send slot on: the pump sees the close and fails every
+        // other pending op, a send already queued behind us fails on the dead fd, and the next op reconnects.
         pending_.erase(rid);
+        drop_fd();
+        release_send();
         co_return std::unexpected(net_error::send);
     }
+    release_send();
 
     co_await reply_awaitable{&slot}; // the pump fills slot + resumes us (or fail_all does, with failed=true)
     pending_.erase(rid);             // defensive: the pump already erased on delivery
