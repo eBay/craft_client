@@ -116,6 +116,7 @@ void craft_async_conn::shutdown() noexcept {
 
 sisl::async::light_task< int > craft_async_conn::ring_connect() {
     fd_ = ::socket(AF_INET, SOCK_STREAM, 0);
+    ++conn_gen_;
     if (fd_ >= 0) { // see set_nodelay in conn.cpp: CRAFT is request/response, so Nagle only ever adds latency
         int const one = 1;
         ::setsockopt(fd_, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
@@ -225,6 +226,7 @@ craft_async_conn::round_trip(wire::op o, std::span< uint8_t const > op_hdr, std:
     // Hold the wire's send slot for the WHOLE of this message so its bytes are contiguous on the socket, then
     // release before waiting for the reply (the next op sends while we wait; replies demux by request_id).
     co_await send_awaitable{this};
+    uint64_t const gen = conn_gen_; // the connection this frame goes out on
     int const sr = co_await ring_send_all(out);
     if (sr < 0) {
         // The frame may be PARTIALLY on the socket (ring_send_all stops after a short send that errors, or when no
@@ -232,8 +234,10 @@ craft_async_conn::round_trip(wire::op o, std::span< uint8_t const > op_hdr, std:
         // could parse a frame whose payload mixes the two, and the caller would report it as "never delivered"
         // (REPLICA_DOWN). Drop the socket BEFORE handing the send slot on: the pump sees the close and fails every
         // other pending op, a send already queued behind us fails on the dead fd, and the next op reconnects.
+        // Only if this is still the connection we sent on: a stale send's late failure must never close a newer
+        // socket that a reconnect opened meanwhile.
         pending_.erase(rid);
-        drop_fd();
+        if (gen == conn_gen_) drop_fd();
         release_send();
         co_return std::unexpected(net_error::send);
     }
