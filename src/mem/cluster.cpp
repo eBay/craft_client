@@ -398,6 +398,7 @@ result< LoginResult > MemTransport::run_login(MemCraftReplica* caller, uint64_t 
     int64_t rs = -1;
     for (auto* r : live)
         rs = std::max(rs, r->peek_lsns().last_append_lsn);
+    if (login_poll_hook_) login_poll_hook_();
     // Phase 1b: resolve every unresolved slot <= rs (fill from a holder, or verdict Empty) -- failed writes of the
     // previous session are decided here, not mid-session.
     resolve_slots_upto(live, rs);

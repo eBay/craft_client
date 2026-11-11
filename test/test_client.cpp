@@ -286,14 +286,15 @@ TEST(CraftClient, N3_NextLoginFillsAFailedWriteHeldByALiveMember) {
         EXPECT_EQ(r->stats().journal_slots, 2u) << "every live member holds the filled slot";
 }
 
-// When no live member holds the failed write (its only copy is stuck in a 10 s-delayed transport), no replica's
+// When no live member holds the failed write (its only copy is stuck in a 1 s-delayed transport), no replica's
 // last_append covers it, so the next login's starting point is below it: the write simply never happened, and
-// the new session reuses the dLSN. The late arrival carries the old term and is fenced out.
+// the new session reuses the dLSN. The late arrival carries the old term and is fenced out -- the test waits for
+// it to land and checks the reused slot afterwards.
 TEST(CraftClient, N3_NextLoginDropsAFailedWriteNobodyHolds) {
     auto cl = make_cluster(3);
     cl.set.net->set_op_timeout(std::chrono::milliseconds{20});
-    cl.set.net->set_delay(craft::mem_replica_id(cl.vid, 0), std::chrono::seconds{10}); // stuck, lands late
-    cl.set.net->force_subquorum({craft::mem_replica_id(cl.vid, 0)});                   // 1 and 2 refuse outright
+    cl.set.net->set_delay(craft::mem_replica_id(cl.vid, 0), std::chrono::seconds{1}); // stuck, lands late
+    cl.set.net->force_subquorum({craft::mem_replica_id(cl.vid, 0)});                  // 1 and 2 refuse outright
 
     auto v = page_of(0x50);
     EXPECT_FALSE(wr(*cl.client, 7, v)); // leg 0 times out, legs 1-2 refuse -> failed (not provably absent)
@@ -306,6 +307,44 @@ TEST(CraftClient, N3_NextLoginDropsAFailedWriteNobodyHolds) {
     auto w = page_of(0x51);
     ASSERT_TRUE(wr(*fresh, 7, w)) << "the new session reuses dLSN 0";
     EXPECT_EQ(rd(*fresh, 7), w);
+
+    // Wait for the old write's delayed delivery to replica 0, then check it changed nothing (review on #6).
+    auto const deadline = std::chrono::steady_clock::now() + std::chrono::seconds{5};
+    while (cl.set.replicas[0]->stats().stale_term_writes == 0 && std::chrono::steady_clock::now() < deadline)
+        std::this_thread::sleep_for(std::chrono::milliseconds{10});
+    ASSERT_EQ(cl.set.replicas[0]->stats().stale_term_writes, 1u) << "the late old-session write was delivered";
+    EXPECT_EQ(rd(*fresh, 7), w) << "and rejected: the reused slot keeps the new session's data";
+    for (auto& r : cl.set.replicas)
+        EXPECT_EQ(r->stats().journal_slots, 1u);
+}
+
+// An old-session write that reaches the members after the login polled them but before it resolves any slot is
+// rejected: the fence comes BEFORE the poll. Were it moved after resolution, this write could land in a slot the
+// scan saw absent, be acked, and then be voided by an Empty verdict (review on #6).
+TEST(CraftClient, N3_OldSessionWriteBetweenPollAndResolutionIsRejected) {
+    auto cl = make_cluster(3);
+    auto v = page_of(0x60);
+    ASSERT_TRUE(wr(*cl.client, 1, v)); // dLSN 0
+    uint64_t const old_term = cl.client->term();
+
+    auto late = page_of(0x61);
+    int rejected = 0;
+    cl.set.net->set_login_poll_hook_for_test([&] {
+        for (auto& r : cl.set.replicas) {
+            auto res = rg(r->write(nullptr, client_hdr{.term = old_term, .commit_lsn = 0, .all_committed_lsn = 0},
+                                   /*dlsn=*/1, blk(2), PAGE, one_iov(late)));
+            if (!res && res.error() == make_error_condition(craft_error::STALE_TERM)) ++rejected;
+        }
+    });
+    auto fresh = relogin(cl, TOKEN + 1);
+    cl.set.net->set_login_poll_hook_for_test(nullptr);
+
+    EXPECT_EQ(rejected, 3);
+    for (auto& r : cl.set.replicas)
+        EXPECT_EQ(r->stats().stale_term_writes, 1u);
+    EXPECT_EQ(fresh->commit_lsn(), 0);
+    EXPECT_EQ(rd(*fresh, 2), page_of(0)) << "the late write never landed";
+    EXPECT_EQ(rd(*fresh, 1), v);
 }
 
 // --- session establishment ---
