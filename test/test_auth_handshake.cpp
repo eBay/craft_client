@@ -262,6 +262,13 @@ std::expected< void, net::net_error > ready_on_ring(replica_script rs, std::opti
     return r;
 }
 
+using ka_result = std::optional< std::expected< net::lsn_reply, net::net_error > >;
+// Named wrapper, not a capturing lambda: its frame must outlive the first suspension.
+async_status issue_conn_keep_alive(net::craft_async_conn* c, std::shared_ptr< ka_result > out) {
+    *out = co_await c->keep_alive(/*commit_lsn=*/-1, /*all_committed_lsn=*/-1);
+    co_return sisl::ok();
+}
+
 async_status issue_keep_alive(CraftTcpReplica* p, ::io_uring* q, client_hdr hdr,
                               std::shared_ptr< std::optional< result< lsn_pair > > > out) {
     *out = co_await p->keep_alive(q, hdr);
@@ -572,4 +579,81 @@ TEST(CraftAuthHandshake, OnRingRetryAfterHandshakeFailure) {
             << "reconnected, re-authenticated, HELO refused again";
     }
     replica.join();
+}
+
+// ── send faults on the ring connection (review on craft_client #6) ──
+
+// A send that fails after part of its frame is on the socket drops the connection: the fragment can never be
+// followed by the next message's bytes. The op queued behind it fails too (on the dead socket), nothing is left
+// pending, and the next op reconnects and goes through.
+TEST(CraftAuthHandshake, OnRingSendFailureMidFrameDropsTheConnection) {
+    auto rs = replica_script{};
+    rs.enforce = false;
+    rs.connections = 2;
+    scripted_replica replica{rs};
+    {
+        ring_session ring{replica.port(), std::nullopt};
+        ASSERT_TRUE(ring.ready().has_value());
+
+        int calls = 0;
+        ring.conn->set_send_fault_for_test([&calls](std::size_t, std::size_t) -> long {
+            ++calls;
+            if (calls == 1) return 10;   // the first frame: only 10 bytes go out...
+            if (calls == 2) return -EIO; // ...then its send fails
+            return 0;
+        });
+        auto a = std::make_shared< ka_result >();
+        auto b = std::make_shared< ka_result >();
+        issue_conn_keep_alive(ring.conn.get(), a).detach(); // takes the send slot
+        issue_conn_keep_alive(ring.conn.get(), b).detach(); // queued behind it
+        ASSERT_TRUE(ring.driver.drive_until([&] { return a->has_value() && b->has_value(); }));
+        ASSERT_FALSE(a->value().has_value());
+        EXPECT_EQ(a->value().error(), net::net_error::send);
+        ASSERT_FALSE(b->value().has_value()) << "the queued op must not follow the fragment";
+        EXPECT_FALSE(ring.conn->ready());
+
+        ring.conn->set_send_fault_for_test(nullptr);
+        ASSERT_TRUE(ring.ready().has_value()) << "the next op reconnects";
+        auto c = std::make_shared< ka_result >();
+        issue_conn_keep_alive(ring.conn.get(), c).detach();
+        ASSERT_TRUE(ring.driver.drive_until([&] { return c->has_value(); }));
+        EXPECT_TRUE(c->value().has_value()) << "the new connection carries traffic";
+        ring.driver.drain_for(std::chrono::milliseconds{50});
+    }
+    replica.join();
+    EXPECT_EQ(replica.accepted(), 2);
+}
+
+// A send failure that belongs to an older connection (a reconnect opened a newer one meanwhile) must not close the
+// newer socket: the connection stays usable and no reconnect happens.
+TEST(CraftAuthHandshake, OnRingStaleSendFailureLeavesTheNewConnection) {
+    auto rs = replica_script{};
+    rs.enforce = false;
+    rs.connections = 2;
+    scripted_replica replica{rs};
+    {
+        ring_session ring{replica.port(), std::nullopt};
+        ASSERT_TRUE(ring.ready().has_value());
+
+        auto* conn = ring.conn.get();
+        ring.conn->set_send_fault_for_test([conn](std::size_t, std::size_t) -> long {
+            conn->bump_conn_gen_for_test(); // as if a reconnect had replaced the socket this send was issued on
+            return -EIO;
+        });
+        auto a = std::make_shared< ka_result >();
+        issue_conn_keep_alive(ring.conn.get(), a).detach();
+        ASSERT_TRUE(ring.driver.drive_until([&] { return a->has_value(); }));
+        ASSERT_FALSE(a->value().has_value());
+        EXPECT_EQ(a->value().error(), net::net_error::send);
+        EXPECT_TRUE(ring.conn->ready()) << "the stale failure left the current socket alone";
+
+        ring.conn->set_send_fault_for_test(nullptr);
+        auto b = std::make_shared< ka_result >();
+        issue_conn_keep_alive(ring.conn.get(), b).detach();
+        ASSERT_TRUE(ring.driver.drive_until([&] { return b->has_value(); }));
+        EXPECT_TRUE(b->value().has_value());
+        ring.driver.drain_for(std::chrono::milliseconds{50});
+    }
+    replica.join();
+    EXPECT_EQ(replica.accepted(), 1) << "no reconnect";
 }
