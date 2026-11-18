@@ -124,6 +124,11 @@ void drive_keepalives(client_handle const& c, ::io_uring* q, std::size_t exclude
 std::error_condition replace_member(client_handle const& c, peer_id_t const& old_id,
                                     std::shared_ptr< craft_replica > backend);
 
+// The member id each slot currently holds, in slot order (the order route_caught_up's index uses).
+std::vector< peer_id_t > member_ids(client_handle const& c);
+// The member id a backend serves (backends are opaque here; this is the one thing a driver may ask of one).
+peer_id_t backend_id(std::shared_ptr< craft_replica > const& backend);
+
 uint32_t lba_size(client_handle const& c); // volume block size in bytes (alignment unit for addr/len)
 uint64_t capacity(client_handle const& c); // volume size in bytes (a block-device driver's device geometry)
 uint32_t max_tx(client_handle const& c);   // volume max transfer in bytes (login-conveyed; a driver caps IO to it)

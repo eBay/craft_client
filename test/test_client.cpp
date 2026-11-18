@@ -1090,6 +1090,8 @@ TEST(CraftClient, ReplaceMemberRoutesAroundTheNewMemberUntilItCatchesUp) {
     for (int i = 0; i < 4; ++i)
         EXPECT_EQ(rd(*client, 3), a);
 
+    EXPECT_EQ(craft::member_ids(client)[2], set.replicas[2]->id());
+    EXPECT_EQ(craft::backend_id(fresh), set.replicas[2]->id());
     ASSERT_TRUE(rg(client->flush(nullptr)).has_value()); // keep_alive: the new member reports its commit_lsn
     EXPECT_TRUE(client->route_caught_up(2));
     for (int i = 0; i < 6; ++i)

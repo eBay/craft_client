@@ -546,5 +546,7 @@ std::error_condition replace_member(client_handle const& c, peer_id_t const& old
                                     std::shared_ptr< craft_replica > backend) {
     return c->replace_member(old_id, std::move(backend));
 }
+std::vector< peer_id_t > member_ids(client_handle const& c) { return c->member_ids(); }
+peer_id_t backend_id(std::shared_ptr< craft_replica > const& backend) { return backend->id(); }
 
 } // namespace craft

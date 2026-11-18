@@ -72,6 +72,14 @@ public:
     int64_t all_committed_lsn() const { return route_->all_committed(); }
     tracker_stats dlsn_stats(std::size_t sample_limit = 16) const { return tracker_->stats(sample_limit); }
     std::size_t replica_count() const { return members()->backends.size(); }
+    std::vector< peer_id_t > member_ids() const {
+        auto const ms = members();
+        std::vector< peer_id_t > ids;
+        ids.reserve(ms->backends.size());
+        for (auto const& b : ms->backends)
+            ids.push_back(b->id());
+        return ids;
+    }
     uint32_t leader_index() const { return leader_; }
 
 private:
