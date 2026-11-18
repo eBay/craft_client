@@ -78,6 +78,9 @@ Cluster make_cluster(uint32_t n, uint32_t leader = 0) {
 bool wr(craft::craft_client& c, uint64_t off_blk, std::vector< uint8_t >& buf) {
     return rg(c.write(nullptr, blk(off_blk), buf.size(), one_iov(buf))).has_value();
 }
+bool rd_ok(craft::craft_client& c, uint64_t off_blk, std::vector< uint8_t >& dest) {
+    return rg(c.read(nullptr, blk(off_blk), dest.size(), one_iov(dest))).has_value();
+}
 std::vector< uint8_t > rd(craft::craft_client& c, uint64_t off_blk, uint64_t nblk = 1) {
     std::vector< uint8_t > dest(nblk * PAGE, 0xEE);
     auto r = rg(c.read(nullptr, blk(off_blk), nblk * PAGE, one_iov(dest)));
@@ -1025,6 +1028,75 @@ TEST(ReadRouteMap, ReplaceMemberGatesReadsOnTheReplacePoint) {
     EXPECT_TRUE(m.eligible(2, blk(0), PAGE, 20));
     EXPECT_EQ(m.all_committed(), 10);
     EXPECT_EQ(m.generation(2), 1u);
+}
+
+// Copilot review on #7: an old member's missed write that folds AFTER the new member proved commit_lsn >= J must
+// not strand it. Folding no longer records a miss at or below a member's own commit_lsn, and eligibility (c)
+// treats an overlay slot at or below it as held.
+TEST(ReadRouteMap, ReplacedMemberCaughtUpBeforeTheFoldIsNotStranded) {
+    craft::read_route_map m;
+    m.reset(3, /*L=*/-1);
+    m.create(0, blk(0), PAGE);
+    m.record_completion(0, 0, true);
+    m.record_completion(0, 1, true); // durable on 0 and 1; member 2 (the OLD one) still in flight
+    m.begin_replace(2, /*gen=*/1);
+    m.finish_replace(2, /*J=*/0);
+    m.advance_synced(2, 1, 0); // the new member reports commit_lsn 0 == J: it holds dLSN 0
+    EXPECT_TRUE(m.eligible(2, blk(0), PAGE, 0)) << "overlay slot 0 <= its commit_lsn: held";
+    m.record_completion(0, 2, false); // the old member's late miss completes the slot...
+    m.fold_to(0);                     // ...and folds
+    EXPECT_TRUE(m.caught_up(2)) << "the fold did not recreate a Missing entry the new member already covers";
+    EXPECT_TRUE(m.eligible(2, blk(0), PAGE, 0));
+
+    // A member that is genuinely behind still gets the miss.
+    m.create(1, blk(1), PAGE);
+    m.record_completion(1, 0, true);
+    m.record_completion(1, 1, true);
+    m.record_completion(1, 2, false);
+    m.fold_to(1);
+    EXPECT_FALSE(m.eligible(2, blk(1), PAGE, 1)) << "dLSN 1 is above its commit_lsn 0: missing";
+    m.advance_synced(2, 1, 1);
+    EXPECT_TRUE(m.eligible(2, blk(1), PAGE, 1));
+}
+
+// Copilot review on #7: a resolution leg still running against the OLD backend must not credit the new member.
+TEST(ReadRouteMap, ResolutionByAReplacedBackendDoesNotCreditTheNewMember) {
+    craft::read_route_map m;
+    m.reset(3, /*L=*/-1);
+    for (std::size_t i = 0; i < 3; ++i)
+        m.advance_synced(i, 0, -1);
+    m.create(0, blk(0), PAGE);
+    m.record_completion(0, 0, true); // sub-quorum: one holder
+    m.record_completion(0, 1, false);
+    m.record_completion(0, 2, false);
+    m.begin_replace(2, /*gen=*/1);
+    m.finish_replace(2, /*J=*/-1);
+    m.advance_synced(2, 1, -1);
+    m.note_filled(0, 2, /*gen=*/0); // the OLD member (gen 0) resolved it as leader
+    EXPECT_FALSE(m.eligible(2, blk(0), PAGE, 0)) << "durable now, but the new member was not credited";
+    EXPECT_TRUE(m.eligible(0, blk(0), PAGE, 0));
+    m.note_filled(0, 2, /*gen=*/1); // the current backend resolving it does credit it
+    EXPECT_TRUE(m.eligible(2, blk(0), PAGE, 0));
+}
+
+// Copilot review on #7: with a single member, replacing it leaves no eligible reader. A read that finds no eligible
+// member drives keep_alives, so a later read is admitted without a write, flush or probe in between.
+TEST(CraftClient, ReadAfterReplacingTheOnlyMemberRecoversWithoutAWrite) {
+    auto set = craft::make_mem_replica_group(boost::uuids::random_generator()(), 1, PAGE);
+    std::vector< std::shared_ptr< craft::craft_replica > > backends(set.replicas.begin(), set.replicas.end());
+    auto client = std::make_shared< craft::craft_client >(std::move(backends), 0);
+    ASSERT_TRUE(rg(client->login(TOKEN)).has_value());
+    auto a = page_of(0xC3);
+    ASSERT_TRUE(wr(*client, 2, a));
+    ASSERT_FALSE(client->replace_member(set.replicas[0]->id(), set.replicas[0]));
+    ASSERT_FALSE(client->route_caught_up(0));
+    bool served = false;
+    for (int i = 0; i < 50 && !served; ++i) {
+        auto buf = std::vector< uint8_t >(PAGE);
+        served = rd_ok(*client, 2, buf) && buf == a; // NOT_ELIGIBLE first; its keep_alive admits the member
+    }
+    EXPECT_TRUE(served);
+    EXPECT_TRUE(client->route_caught_up(0));
 }
 
 namespace {

@@ -59,6 +59,10 @@ public:
 
     std::shared_ptr< craft_replica > replace(peer_id_t const& old_id, replica_endpoint const& member) {
         std::lock_guard< std::mutex > lk{mu_};
+        // Validate before mutating: a new id that another slot already holds would leave the cluster at, say,
+        // B/B/C while craft_client rejects the swap and stays at A/B/C.
+        for (auto const& b : backends_)
+            if (b->id() == member.id && b->id() != old_id) return nullptr;
         for (auto& b : backends_) {
             if (b->id() != old_id) continue;
             auto proxy = make_proxy(member, vol_, op_timeout_);

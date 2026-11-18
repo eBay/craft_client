@@ -99,4 +99,12 @@ TEST(CraftTcpBuilder, ReplaceTcpMemberSwapsTheBackendInPlace) {
     EXPECT_EQ(now[0], before[0]);
     EXPECT_EQ(now[2], before[2]);
     EXPECT_EQ(replace_tcp_member(cluster, members[1].id, moved), nullptr) << "member 1 is no longer in the set";
+
+    // A new id another slot already holds is refused BEFORE anything changes: the cluster stays as it was, so a
+    // corrected retry for the same slot still works.
+    EXPECT_EQ(replace_tcp_member(cluster, members[0].id, {members[2].id, "127.0.0.3:9200"}), nullptr);
+    EXPECT_EQ(backends(cluster), now);
+    auto const again = replace_tcp_member(cluster, members[0].id, {members[0].id, "127.0.0.3:9200"});
+    ASSERT_NE(again, nullptr) << "keeping the slot's own id is allowed";
+    EXPECT_EQ(backends(cluster)[0], again);
 }

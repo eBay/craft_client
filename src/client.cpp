@@ -286,23 +286,30 @@ std::error_condition craft_client::replace_member(peer_id_t const& old_id, std::
 // filled ones as acked with the router told first (note_filled) so reads route only to certain holders until
 // the commit_lsn certificates catch up. A leg that errors (member down, deposed term) also just ends: the
 // slot stays pinned and the next failed write re-fires the legs.
+//
+// `gen` is the generation of `h` in slot `idx`. A leg whose backend has been replaced (replace_member) stops at the
+// next request instead of draining wants above the replace point against the OLD member, and note_filled does not
+// credit the new member with what the old one resolved; the next failed write fires a leg to the current backend.
 static async_status fire_resolution(::io_uring* q, std::shared_ptr< craft_replica > h, std::size_t idx, uint64_t term,
-                                    std::shared_ptr< dlsn_tracker > tracker, std::shared_ptr< read_route_map > route) {
+                                    uint64_t gen, std::shared_ptr< dlsn_tracker > tracker,
+                                    std::shared_ptr< read_route_map > route) {
     for (;;) {
         while (auto const want = tracker->resolution_want()) {
+            if (route->generation(idx) != gen) break; // replaced: leave the want for the current backend
             client_hdr const hdr{term, tracker->frontier(), route->all_committed()};
             auto r = co_await h->request_resolution(q, hdr, *want);
             if (!r.has_value()) { // NOT_LEADER / down / stale: this peer cannot resolve; leave the want alone
                 route->end_resolution(idx);
                 co_return ok();
             }
-            tracker->retire_upto(r->resolved_upto, r->empty_slots, [&](int64_t d) { route->note_filled(d, idx); });
+            tracker->retire_upto(r->resolved_upto, r->empty_slots, [&](int64_t d) { route->note_filled(d, idx, gen); });
             tracker->clear_resolution_want(r->resolved_upto);
         }
         route->end_resolution(idx);
         // Close the note-then-begin race: a want recorded between our last peek and the flag release would
         // strand until the next failure. Reclaim this peer's flag only if a want is actually pending.
-        if (!tracker->resolution_want() || !route->try_begin_resolution(idx)) co_return ok();
+        if (route->generation(idx) != gen || !tracker->resolution_want() || !route->try_begin_resolution(idx))
+            co_return ok();
     }
 }
 
@@ -315,7 +322,8 @@ void craft_client::request_resolution_round(::io_uring* q, int64_t upto) {
     // Each leg rides the failing write's ring, so its resumptions stay on that queue's reap thread.
     auto const ms = members();
     for (std::size_t m = 0; m < ms->backends.size(); ++m) {
-        if (route_->try_begin_resolution(m)) fire_resolution(q, ms->backends[m], m, term_, tracker_, route_).detach();
+        if (route_->try_begin_resolution(m))
+            fire_resolution(q, ms->backends[m], m, term_, ms->gens[m], tracker_, route_).detach();
     }
 }
 
@@ -378,7 +386,7 @@ async_result< size_t > craft_client::read(::io_uring* q, uint64_t addr, uint64_t
     // RAID1): each ublk queue thread rotates its own reads independently. On a transport-level failure (holder
     // down or timed out) we fail over to the next eligible one; any other error is the client's to surface.
     // `dest` is filled in place, so re-issuing re-fills the same buffer.
-    auto const ms = members();
+    auto ms = members();
     std::size_t const n = ms->backends.size();
     static thread_local std::size_t read_rotor = 0;
     std::size_t const start = read_rotor % n;
@@ -387,6 +395,17 @@ async_result< size_t > craft_client::read(::io_uring* q, uint64_t addr, uint64_t
     for (std::size_t hop = 0; hop < n; ++hop) {
         std::size_t const idx = (start + hop) % n;
         if (!route_->eligible(idx, addr, len, Hmax)) continue;
+        // The router's state for slot `idx` describes the slot's CURRENT backend. If a replace_member ran since
+        // `ms` was loaded (a failover hop can wait out a whole op timeout), the eligibility just computed may be
+        // the new member's while ms->backends[idx] is the old one: reload and re-check, or skip the slot if the
+        // new snapshot is not published yet. Checked AFTER eligible(): begin_replace bumps the generation before
+        // touching any eligibility input, so an eligible() that saw the new member's state sees the new gen here.
+        if (route_->generation(idx) != ms->gens[idx]) {
+            ms = members();
+            if (route_->generation(idx) != ms->gens[idx] || !route_->eligible(idx, addr, len, Hmax) ||
+                route_->generation(idx) != ms->gens[idx])
+                continue;
+        }
         if (!any_eligible) read_rotor = idx + 1; // next read on this queue thread starts at the following peer
         any_eligible = true;
 
@@ -410,7 +429,11 @@ async_result< size_t > craft_client::read(::io_uring* q, uint64_t addr, uint64_t
     }
 
     // No eligible member served it. NOT_ELIGIBLE if none was eligible at all (the winner's holders are all
-    // behind/excluded); NO_QUORUM if holders existed but every one failed the transport.
+    // behind/excluded); NO_QUORUM if holders existed but every one failed the transport. Either way, refresh every
+    // leg's watermark (one outstanding keep_alive per leg) so a member that has caught up -- e.g. one swapped in
+    // by replace_member, or the only member of an N=1 client -- is admitted by the next read, without needing a
+    // write, a flush or an idle probe to happen first.
+    drive_keepalives(q, n);
     co_return std::unexpected(any_eligible ? make_error_condition(craft_error::NO_QUORUM)
                                            : make_error_condition(craft_error::NOT_ELIGIBLE));
 }

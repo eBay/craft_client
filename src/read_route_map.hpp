@@ -231,8 +231,14 @@ public:
                 for (std::size_t i = 0; i < n_; ++i) {
                     if (e.held & bit(i))
                         miss_[i].erase(iv); // holds the latest folded write on this range -> not missing
-                    else
+                    else if (e.dlsn > synced_[i].load(std::memory_order_acquire))
                         miss_[i].set(std::make_pair(iv, e.dlsn)); // missed it -> missing there
+                    else
+                        // Not a holder by its op reply, but its own commit_lsn already covers e.dlsn (it applied
+                        // it via server-side resync -- or it is a member swapped in mid-session whose replace
+                        // point covers e.dlsn): it holds the write, so it is not missing. advance_synced only
+                        // erases on PROGRESS, so recording the miss here would strand a caught-up member.
+                        miss_[i].erase(iv);
                 }
             }
         }
@@ -245,13 +251,15 @@ public:
     //   (a) Synced >= L    -- the member has PROVEN (login / keep_alive / IO replies) it holds the committed
     //                         prefix up to the login frontier; a laggard seeded at the floor is excluded here;
     //   (b) below the frontier: no Missing byte-range overlapping [addr,len) (per-block precise); and
-    //   (c) above the frontier: it holds every DURABLE overlay slot in (folded, Hmax] overlapping the range.
+    //   (c) above the frontier: it holds every DURABLE overlay slot in (folded, Hmax] overlapping the range --
+    //       by its holder bit, or because the slot is at or below its own proven commit_lsn.
     // A slot with fewer than `quorum` holders is a sub-quorum / failed write, never a winner, so skipped in
     // (c) -- UNLESS a resolution round verdicted it durable (note_filled): then it is required even though
     // its recorded holder count is sub-quorum. Among durable slots (c) is still the "holds every overlap"
     // superset (safe for N=3 by quorum intersection); per-block gating there is a further refinement.
     bool eligible(std::size_t idx, uint64_t addr, uint64_t len, int64_t Hmax) {
-        if (synced_[idx].load(std::memory_order_acquire) < floor_[idx].load(std::memory_order_acquire))
+        int64_t const synced = synced_[idx].load(std::memory_order_acquire);
+        if (synced < floor_[idx].load(std::memory_order_acquire))
             return false; // (a): L, or the replace point J for a member swapped in mid-session
         {
             std::shared_lock< std::shared_mutex > mg{map_mu_};
@@ -262,6 +270,9 @@ public:
         bool ok = true;
         overlay_->foreach_all_active(fold + 1, [&](int64_t d, route_slot& s) -> bool {
             if (d > Hmax) return false; // past the horizon; stop
+            // At or below the member's own commit_lsn it has applied every write, this one included, whatever
+            // its op reply said (e.g. the slot was acked by the member it replaced).
+            if (d <= synced) return true;
             uint64_t const held = std::atomic_ref< uint64_t >(s.holders).load(std::memory_order_acquire);
             bool const durable = (static_cast< std::size_t >(std::popcount(held)) >= quorum_) ||
                 (std::atomic_ref< uint8_t >(s.verdict).load(std::memory_order_acquire) != 0);
@@ -282,8 +293,14 @@ public:
     // once it folds -- exactly what a durable-but-non-universal completion would have handed over. Runs
     // before the tracker resolves the slot acked, so the fold (which chases the frontier) cannot pass `d`
     // without seeing the pending entry.
-    void note_filled(int64_t d, std::size_t leader_idx) {
-        uint64_t const lb = bit(leader_idx);
+    //
+    // `gen` is the generation of the backend that resolved it. If slot `leader_idx` has been replaced since,
+    // the copy is on the OLD member: the slot is still durable (verdict), but the new member is NOT credited.
+    // Serialized with begin_replace on fold_mu_, so a credit either lands before the replace (and is covered
+    // by the replace point J) or is refused.
+    void note_filled(int64_t d, std::size_t leader_idx, uint64_t gen) {
+        std::lock_guard< std::mutex > fg{fold_mu_};
+        uint64_t const lb = (gen == gen_[leader_idx].load(std::memory_order_relaxed)) ? bit(leader_idx) : 0;
         overlay_->update(d, [&](route_slot& s) -> bool {
             uint64_t const held = std::atomic_ref< uint64_t >(s.holders).fetch_or(lb, std::memory_order_seq_cst) | lb;
             std::atomic_ref< uint8_t >(s.verdict).store(1, std::memory_order_release);
