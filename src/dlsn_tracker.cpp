@@ -68,7 +68,10 @@ void dlsn_tracker::reset_at(int64_t login_dlsn, uint32_t lba_size) {
 }
 
 int64_t dlsn_tracker::reserve(uint64_t addr, uint64_t len) {
-    int64_t const d = next_dlsn_.fetch_add(1, std::memory_order_relaxed);
+    // seq_cst, not relaxed: craft_client::replace_member relies on it. write() reserves here and then loads the
+    // member snapshot; replace_member stores the new snapshot and then reads issued(). With both sides seq_cst,
+    // either this dLSN is <= the J that replace_member reads, or this write sees the new member.
+    int64_t const d = next_dlsn_.fetch_add(1, std::memory_order_seq_cst);
     tracker_->create(d, dlsn_slot{addr, len, static_cast< uint8_t >(slot_outcome::in_flight)});
     return d;
 }

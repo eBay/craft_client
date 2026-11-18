@@ -539,10 +539,10 @@ TEST(ReadRouteMap, AdvanceSyncedLiftsFloorAndClearsMiss) {
 
     // The floor is the MIN across members, so the laggard pins it below the caught-up ones: members 0 and 1
     // race ahead to dLSN 5, but the floor stays at the baseline until member 2 reports, then tracks member 2.
-    m.advance_synced(0, 5);
-    m.advance_synced(1, 5);
+    m.advance_synced(0, 0, 5);
+    m.advance_synced(1, 0, 5);
     EXPECT_EQ(m.all_committed(), -1) << "member 2 still at the baseline pins the floor, not the leaders' 5";
-    m.advance_synced(2, 0);
+    m.advance_synced(2, 0, 0);
     EXPECT_EQ(m.all_committed(), 0) << "floor tracks the laggard (0), not the caught-up members (5)";
 
     // Member 2's commit_lsn passing dLSN 0 means it applied block 3 (resync filled the hole) -> miss cleared.
@@ -996,6 +996,118 @@ TEST(CraftClient, ReadFailsOverPastHeloNotLeader) {
         EXPECT_EQ(rd(*cl.client, 4), data) << "read " << i;
     for (auto& g : cl.gates)
         g->reject.reset();
+}
+
+// --- mid-session member replacement (replace_member: a replica move) ---
+
+// The router side alone: a replaced slot restarts unsynced, serves no read until its own commit_lsn reaches the
+// replace point J, and ignores replies tagged with the replaced backend's generation.
+TEST(ReadRouteMap, ReplaceMemberGatesReadsOnTheReplacePoint) {
+    craft::read_route_map m;
+    m.reset(3, /*L=*/-1);
+    for (std::size_t i = 0; i < 3; ++i)
+        m.advance_synced(i, 0, 10);
+    ASSERT_TRUE(m.caught_up(2));
+    ASSERT_EQ(m.all_committed(), 10);
+
+    m.begin_replace(2, /*gen=*/1);
+    EXPECT_FALSE(m.caught_up(2));
+    EXPECT_FALSE(m.eligible(2, blk(0), PAGE, 10));
+    EXPECT_EQ(m.all_committed(), -1) << "the new member pins the reclaim floor until it reports progress";
+    m.finish_replace(2, /*J=*/20);
+
+    m.advance_synced(2, /*gen=*/0, 30); // a late reply from the OLD member
+    EXPECT_FALSE(m.caught_up(2)) << "a replaced backend's reply says nothing about the new member";
+    m.advance_synced(2, 1, 19);
+    EXPECT_FALSE(m.eligible(2, blk(0), PAGE, 19)) << "below the replace point";
+    m.advance_synced(2, 1, 20);
+    EXPECT_TRUE(m.caught_up(2));
+    EXPECT_TRUE(m.eligible(2, blk(0), PAGE, 20));
+    EXPECT_EQ(m.all_committed(), 10);
+    EXPECT_EQ(m.generation(2), 1u);
+}
+
+namespace {
+// Wraps a replica and counts the ops it carried, so a test can tell which backend a write reached.
+class counting_replica final : public craft::craft_replica {
+public:
+    explicit counting_replica(std::shared_ptr< craft::craft_replica > inner) : inner_{std::move(inner)} {}
+    std::atomic< int > writes{0};
+    std::atomic< int > reads{0};
+
+    async_result< LoginResult > login(uint64_t client_token) override { return inner_->login(client_token); }
+    async_status logout(client_hdr hdr) override { return inner_->logout(hdr); }
+    async_result< lsn_pair > write(::io_uring* q, client_hdr hdr, int64_t dlsn, uint64_t addr, uint64_t len,
+                                   sisl::sg_list data) override {
+        ++writes;
+        return inner_->write(q, hdr, dlsn, addr, len, std::move(data));
+    }
+    async_result< read_result > read(::io_uring* q, client_hdr hdr, int64_t read_lsn, uint64_t addr, uint64_t len,
+                                     sisl::sg_list dest) override {
+        ++reads;
+        return inner_->read(q, hdr, read_lsn, addr, len, std::move(dest));
+    }
+    async_result< lsn_pair > keep_alive(::io_uring* q, client_hdr hdr) override { return inner_->keep_alive(q, hdr); }
+    async_result< resolution_result > request_resolution(::io_uring* q, client_hdr hdr, int64_t upto) override {
+        return inner_->request_resolution(q, hdr, upto);
+    }
+    peer_id_t id() const override { return inner_->id(); }
+
+private:
+    std::shared_ptr< craft::craft_replica > inner_;
+};
+} // namespace
+
+// A replica move end to end, over the reference cluster: the slot's backend is swapped while the session stays up.
+// Writes after the swap reach the new backend, the old one gets none, reads route around the new member until it
+// proves it holds everything up to the swap point, and then it serves reads again.
+TEST(CraftClient, ReplaceMemberRoutesAroundTheNewMemberUntilItCatchesUp) {
+    auto set = craft::make_mem_replica_group(boost::uuids::random_generator()(), 3, PAGE);
+    std::vector< std::shared_ptr< counting_replica > > legs;
+    std::vector< std::shared_ptr< craft::craft_replica > > backends;
+    for (auto const& r : set.replicas) {
+        legs.push_back(std::make_shared< counting_replica >(r));
+        backends.push_back(legs.back());
+    }
+    auto client = std::make_shared< craft::craft_client >(std::move(backends), 0);
+    ASSERT_TRUE(rg(client->login(TOKEN)).has_value());
+    auto a = page_of(0xA1);
+    ASSERT_TRUE(wr(*client, 3, a));
+
+    // Swap member 2 for a new backend (here: the same server behind a fresh proxy, so it really holds the data).
+    auto fresh = std::make_shared< counting_replica >(set.replicas[2]);
+    ASSERT_FALSE(client->replace_member(set.replicas[2]->id(), fresh));
+    EXPECT_FALSE(client->route_caught_up(2)) << "untrusted until it reports its own commit_lsn";
+
+    int const old_writes = legs[2]->writes.load();
+    auto b = page_of(0xB2);
+    ASSERT_TRUE(wr(*client, 4, b));
+    EXPECT_EQ(legs[2]->writes.load(), old_writes) << "the replaced backend gets no new write";
+    EXPECT_EQ(fresh->writes.load(), 1) << "the new backend gets every write issued after the swap";
+
+    // Reads stay correct throughout (whether or not a read's own keep_alive has already let the new member in; the
+    // gating itself is pinned down by ReadRouteMap.ReplaceMemberGatesReadsOnTheReplacePoint).
+    for (int i = 0; i < 4; ++i)
+        EXPECT_EQ(rd(*client, 3), a);
+
+    ASSERT_TRUE(rg(client->flush(nullptr)).has_value()); // keep_alive: the new member reports its commit_lsn
+    EXPECT_TRUE(client->route_caught_up(2));
+    for (int i = 0; i < 6; ++i)
+        EXPECT_EQ(rd(*client, 4), b);
+    EXPECT_GT(fresh->reads.load(), 0) << "once caught up it serves reads again (rotating start)";
+}
+
+TEST(CraftClient, ReplaceMemberRejectsBadArguments) {
+    auto cl = make_gated_cluster(3);
+    auto const other = std::make_shared< counting_replica >(cl.set.replicas[1]);
+    EXPECT_EQ(craft::replace_member(cl.client, boost::uuids::random_generator()(), other), // the public verb
+              make_error_condition(std::errc::no_such_device));
+    EXPECT_EQ(cl.client->replace_member(cl.set.replicas[0]->id(), other),
+              make_error_condition(std::errc::invalid_argument))
+        << "member 1 would be in the set twice";
+    EXPECT_EQ(cl.client->replace_member(cl.set.replicas[0]->id(), nullptr),
+              make_error_condition(std::errc::invalid_argument));
+    EXPECT_EQ(cl.client->replica_count(), 3u);
 }
 
 int main(int argc, char* argv[]) {

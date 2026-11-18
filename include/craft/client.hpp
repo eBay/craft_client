@@ -22,6 +22,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <system_error>
 #include <vector>
 
 #include <sisl/fds/buffer.hpp> // sisl::sg_list
@@ -111,6 +112,17 @@ async_status logout(client_handle const& c);
 inline constexpr std::size_t k_no_leg = ~std::size_t{0};
 void drive_keepalives(client_handle const& c, std::size_t exclude_idx = k_no_leg);
 void drive_keepalives(client_handle const& c, ::io_uring* q, std::size_t exclude_idx = k_no_leg);
+
+// Replace member `old_id` with `backend` while IO runs: a replica move. The member count is unchanged and the new
+// backend takes the old one's slot. IO already in flight to the old backend finishes there; every write issued
+// after the call reaches the new backend. The new member serves no read until its own commit_lsn reaches the
+// highest dLSN issued before the swap (server-side resync gets it there); until then reads route around it, as
+// they do around any member that is behind. Get the backend from the transport the client was built over (e.g.
+// replace_tcp_member in <craft/tcp.hpp>). Not concurrent with login / logout.
+// Errors: no_such_device if `old_id` is not a member; invalid_argument for a null backend or one whose id is
+// already another member's.
+std::error_condition replace_member(client_handle const& c, peer_id_t const& old_id,
+                                    std::shared_ptr< craft_replica > backend);
 
 uint32_t lba_size(client_handle const& c); // volume block size in bytes (alignment unit for addr/len)
 uint64_t capacity(client_handle const& c); // volume size in bytes (a block-device driver's device geometry)

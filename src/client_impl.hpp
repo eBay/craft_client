@@ -20,9 +20,11 @@
 // <craft/client.hpp> and calls the free functions. Only make_client and those free functions (all defined in
 // client.cpp) touch it. A storage backend is never on this side of the wire and never constructs one.
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <system_error>
 #include <vector>
@@ -40,7 +42,10 @@ class craft_client {
 public:
     craft_client(std::vector< std::shared_ptr< craft_replica > > replicas, uint32_t leader = 0,
                  uint32_t max_inflight = 128) :
-            replicas_(std::move(replicas)), leader_(leader), tracker_(std::make_shared< dlsn_tracker >(max_inflight)) {}
+            members_(std::make_shared< member_set const >(
+                member_set{replicas, std::vector< uint64_t >(replicas.size(), 0)})),
+            leader_(leader),
+            tracker_(std::make_shared< dlsn_tracker >(max_inflight)) {}
 
     // Mid-session verbs carry the caller's queue ring (`q`, null = the blocking tier) straight through to every
     // backend leg they fan out -- one IO's whole leg chain rides one ring, so its resumptions all land back on
@@ -51,6 +56,8 @@ public:
     async_status flush(::io_uring* q);
     async_status logout();
     void drive_keepalives(::io_uring* q, std::size_t exclude_idx);
+    // Swap the backend of member `old_id` for `backend` while IO runs (a replica move). See client.hpp.
+    std::error_condition replace_member(peer_id_t const& old_id, std::shared_ptr< craft_replica > backend);
 
     uint32_t lba_size() const { return lba_size_; }
     uint64_t capacity() const { return capacity_; }
@@ -64,12 +71,12 @@ public:
     bool route_caught_up(std::size_t idx) const { return route_->caught_up(idx); }
     int64_t all_committed_lsn() const { return route_->all_committed(); }
     tracker_stats dlsn_stats(std::size_t sample_limit = 16) const { return tracker_->stats(sample_limit); }
-    std::size_t replica_count() const { return replicas_.size(); }
+    std::size_t replica_count() const { return members()->backends.size(); }
     uint32_t leader_index() const { return leader_; }
 
 private:
     client_hdr make_hdr() const;
-    std::size_t quorum() const { return replicas_.size() / 2 + 1; }
+    std::size_t quorum() const { return members()->backends.size() / 2 + 1; }
     // Trim the router's overlay from the WRITE path, exactly as dlsn_tracker batch-truncates its own
     // StreamTracker on resolve (k_trunc_batch). Without this, read_route_map::fold_to() is reached ONLY from
     // read(), so a write-only stream grows the overlay without bound and the first read after a burst pays to
@@ -87,7 +94,16 @@ private:
     // whose failure fired it.
     void request_resolution_round(::io_uring* q, int64_t upto);
 
-    std::vector< std::shared_ptr< craft_replica > > replicas_;
+    // The members, as one immutable snapshot swapped atomically by replace_member. Every op loads it ONCE and
+    // drives that snapshot's backends; `gens[i]` is the generation of backends[i], carried into the router with
+    // each reply so a reply from a replaced backend is ignored. The member count never changes.
+    struct member_set {
+        std::vector< std::shared_ptr< craft_replica > > backends;
+        std::vector< uint64_t > gens;
+    };
+    std::shared_ptr< member_set const > members() const { return members_.load(std::memory_order_acquire); }
+    std::atomic< std::shared_ptr< member_set const > > members_;
+    std::mutex replace_mu_; // serializes replace_member against itself and against login's router reset
     uint32_t leader_{0};
     uint64_t term_{0};
     uint64_t client_token_{0};

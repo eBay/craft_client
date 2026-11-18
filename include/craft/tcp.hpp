@@ -47,6 +47,13 @@ tcp_cluster_handle make_tcp_cluster(std::vector< replica_endpoint > const& membe
                                     std::chrono::milliseconds op_timeout = std::chrono::milliseconds{0});
 
 // The backends to hand to make_client(); same order as `members`. Valid until the last handle is dropped.
-std::vector< std::shared_ptr< craft_replica > > const& backends(tcp_cluster_handle const& c);
+std::vector< std::shared_ptr< craft_replica > > backends(tcp_cluster_handle const& c);
+
+// A replica move: build the backend for `member` (same volume and op timeout as the cluster) in place of member
+// `old_id`, and return it for craft::replace_member(client, old_id, backend). The cluster keeps owning the old
+// proxy until the cluster itself is dropped, so IO still in flight to it can finish. Returns null if `old_id` is
+// not a member of the cluster. Throws on a malformed "host:port", like make_tcp_cluster.
+std::shared_ptr< craft_replica > replace_tcp_member(tcp_cluster_handle const& c, peer_id_t const& old_id,
+                                                    replica_endpoint const& member);
 
 } // namespace craft

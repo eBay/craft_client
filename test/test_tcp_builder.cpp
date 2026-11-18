@@ -25,6 +25,8 @@
 
 #include <gtest/gtest.h>
 
+#include <boost/uuid/uuid_generators.hpp>
+
 #include <craft/client.hpp>       // the opaque handle + the free-function verbs
 #include <craft/tcp.hpp>          // make_tcp_cluster -- the PUBLIC builder under test
 #include "net/cluster_server.hpp" // the reference server to connect to (test-support)
@@ -75,4 +77,26 @@ TEST(CraftTcpBuilder, ConnectAndDriveOverTcp) {
     } // c destroyed first (releases its proxy refs), then cluster drains each worker -- all BEFORE stop() below
 
     server->stop();
+}
+
+// A replica move: the builder hands out the backend for the new endpoint in the old member's slot. Nothing connects
+// until an op is issued, so no server is needed to check the swap itself.
+TEST(CraftTcpBuilder, ReplaceTcpMemberSwapsTheBackendInPlace) {
+    volume_id_t const vid = boost::uuids::random_generator()();
+    std::vector< replica_endpoint > members;
+    for (int i = 0; i < 3; ++i)
+        members.push_back({boost::uuids::random_generator()(), "127.0.0.1:" + std::to_string(9000 + i)});
+    auto cluster = make_tcp_cluster(members, vid);
+    auto const before = backends(cluster);
+
+    replica_endpoint const moved{boost::uuids::random_generator()(), "127.0.0.2:9100"};
+    auto const b = replace_tcp_member(cluster, members[1].id, moved);
+    ASSERT_NE(b, nullptr);
+    auto const now = backends(cluster);
+    ASSERT_EQ(now.size(), 3u);
+    EXPECT_EQ(now[1], b);
+    EXPECT_NE(now[1], before[1]);
+    EXPECT_EQ(now[0], before[0]);
+    EXPECT_EQ(now[2], before[2]);
+    EXPECT_EQ(replace_tcp_member(cluster, members[1].id, moved), nullptr) << "member 1 is no longer in the set";
 }

@@ -132,6 +132,8 @@ public:
                 miss_[i].clear();
         }
         for (std::size_t i = 0; i < n; ++i) {
+            gen_[i].store(0, std::memory_order_relaxed);
+            floor_[i].store(login_dlsn, std::memory_order_relaxed);  // a member serves reads once synced >= this
             synced_[i].store(k_unsynced, std::memory_order_relaxed); // raised per-member from its real commit_lsn
             ka_inflight_[i].store(false, std::memory_order_relaxed);
             rr_inflight_[i].store(false, std::memory_order_relaxed);
@@ -249,7 +251,8 @@ public:
     // its recorded holder count is sub-quorum. Among durable slots (c) is still the "holds every overlap"
     // superset (safe for N=3 by quorum intersection); per-block gating there is a further refinement.
     bool eligible(std::size_t idx, uint64_t addr, uint64_t len, int64_t Hmax) {
-        if (synced_[idx].load(std::memory_order_acquire) < login_dlsn_) return false; // (a)
+        if (synced_[idx].load(std::memory_order_acquire) < floor_[idx].load(std::memory_order_acquire))
+            return false; // (a): L, or the replace point J for a member swapped in mid-session
         {
             std::shared_lock< std::shared_mutex > mg{map_mu_};
             if (boost::icl::intersects(miss_[idx], byte_ivl(addr, len))) return false; // (b)
@@ -302,12 +305,17 @@ public:
     // dormant until server-side resync fills the member's holes: a laggard's commit_lsn stalls just below its
     // first Missing hole, so nothing at/above that hole clears until resync fills it (then C passes it and the
     // erase fires). This is the sole place synced_ advances and the sole non-fold map mutation.
-    void advance_synced(std::size_t idx, int64_t C) {
+    //
+    // `gen` is the generation of the backend the reply came from (member_set::gens at issue). A reply from a
+    // member that has since been replaced carries an older generation and is ignored: it reports the OLD member's
+    // commit_lsn, which says nothing about the new one.
+    void advance_synced(std::size_t idx, uint64_t gen, int64_t C) {
         // Lock-free monotonic pre-check: every IO response piggybacks the member's watermarks now, so this is
         // fed from the write/read ack paths too, not just the detached keep_alives -- the no-news case must
         // stay a single atomic load.
         if (C <= synced_[idx].load(std::memory_order_acquire)) return;
         std::lock_guard< std::mutex > fg{fold_mu_};
+        if (gen != gen_[idx].load(std::memory_order_relaxed)) return; // from a replaced member
         if (C <= synced_[idx].load(std::memory_order_relaxed)) return;
         synced_[idx].store(C, std::memory_order_release);
         int64_t floor = synced_[0].load(std::memory_order_relaxed); // min commit_lsn across members
@@ -321,6 +329,34 @@ public:
         for (auto const& iv : drop)
             miss_[idx].erase(iv);
     }
+
+    // ── mid-session member replacement (craft::replace_member) ──
+    //
+    // Two steps around the publication of the new backend:
+    //   begin_replace(idx, gen): the slot now belongs to backend generation `gen`. Until finish_replace it serves no
+    //     read (floor = never); its synced_ restarts at the unsynced floor (which also pins all_committed_, the
+    //     reclaim floor, until the new member reports progress); its Missing map is cleared, since it described the
+    //     old member.
+    //   finish_replace(idx, J): J is the highest dLSN reserved by the time the new backend was published. Every
+    //     dLSN above J is broadcast to the new backend and tracked as usual; the new member is trusted for reads
+    //     only once its own commit_lsn reaches J, i.e. once server-side resync has given it everything up to J.
+    // Late completions from the old backend (dLSNs <= J) may still set this slot's holder bits; that is harmless,
+    // because the floor J already requires the new member to hold everything up to J itself.
+    void begin_replace(std::size_t idx, uint64_t gen) {
+        std::lock_guard< std::mutex > fg{fold_mu_};
+        gen_[idx].store(gen, std::memory_order_release);
+        floor_[idx].store(kNever, std::memory_order_release);
+        synced_[idx].store(k_unsynced, std::memory_order_release);
+        all_committed_.store(k_unsynced, std::memory_order_release);
+        std::unique_lock< std::shared_mutex > mg{map_mu_};
+        miss_[idx].clear();
+    }
+    void finish_replace(std::size_t idx, int64_t J) {
+        floor_[idx].store(std::max(J, login_dlsn_), std::memory_order_release);
+    }
+    uint64_t generation(std::size_t idx) const { return gen_[idx].load(std::memory_order_acquire); }
+    // After reset(): adopt the generation the client's member set holds for slot `idx` (it survives re-login).
+    void set_generation(std::size_t idx, uint64_t gen) { gen_[idx].store(gen, std::memory_order_release); }
 
     // At-most-one outstanding keep_alive per member (leg) -- the collapse for the client's timer-less keep_alive
     // drive. try_begin_keepalive returns true iff the caller may fire one (none already in flight for `idx`);
@@ -341,7 +377,7 @@ public:
     // The set-wide journal reclaim floor: min commit_lsn across members (client_hdr.all_committed_lsn).
     int64_t all_committed() const { return all_committed_.load(std::memory_order_acquire); }
     bool caught_up(std::size_t idx) const {
-        if (synced_[idx].load(std::memory_order_acquire) < login_dlsn_) return false;
+        if (synced_[idx].load(std::memory_order_acquire) < floor_[idx].load(std::memory_order_acquire)) return false;
         std::shared_lock< std::shared_mutex > mg{map_mu_};
         return miss_[idx].empty();
     }
@@ -385,6 +421,10 @@ private:
     std::array< missing_map, k_max_members > miss_; // below the frontier: per-member Missing byte ranges
     std::array< std::atomic< int64_t >, k_max_members >
         synced_{}; // per member: client's model of its commit_lsn (>= L)
+    std::array< std::atomic< int64_t >, k_max_members >
+        floor_{}; // per member: synced_ must reach this to serve reads (L; J after a mid-session replace)
+    std::array< std::atomic< uint64_t >, k_max_members >
+        gen_{}; // per member: generation of the backend in this slot; replies from older generations are ignored
     std::array< std::atomic< bool >, k_max_members >
         ka_inflight_{}; // per member: a keep_alive is outstanding (the one-per-leg collapse)
     std::array< std::atomic< bool >, k_max_members >
