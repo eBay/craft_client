@@ -1079,6 +1079,34 @@ TEST(ReadRouteMap, ResolutionByAReplacedBackendDoesNotCreditTheNewMember) {
     EXPECT_TRUE(m.eligible(2, blk(0), PAGE, 0));
 }
 
+// Copilot review on #7: the per-leg gates are generation-scoped. A leg still out to a replaced backend neither
+// blocks a leg to the slot's new backend nor, when it completes, releases the new leg's gate.
+TEST(ReadRouteMap, LegGatesAreGenerationScoped) {
+    craft::read_route_map m;
+    m.reset(3, /*L=*/-1);
+    EXPECT_TRUE(m.try_begin_resolution(1, /*gen=*/0)) << "leg to the old backend";
+    EXPECT_FALSE(m.try_begin_resolution(1, 0)) << "same generation: collapsed";
+    EXPECT_TRUE(m.try_begin_resolution(1, 1)) << "the new backend's leg may start while the old one is out";
+    EXPECT_FALSE(m.try_begin_resolution(1, 1));
+    EXPECT_FALSE(m.try_begin_resolution(1, 0)) << "an older generation cannot take a newer leg's gate";
+    m.end_resolution(1, 0); // the old leg completes late
+    EXPECT_FALSE(m.try_begin_resolution(1, 1)) << "...and does not release the new leg's gate";
+    m.end_resolution(1, 1);
+    EXPECT_TRUE(m.try_begin_resolution(1, 1)) << "released by its owner";
+
+    EXPECT_TRUE(m.try_begin_keepalive(2, 0));
+    EXPECT_TRUE(m.try_begin_keepalive(2, 1)) << "same rule for keep_alives";
+    m.end_keepalive(2, 0);
+    EXPECT_FALSE(m.try_begin_keepalive(2, 1));
+    m.end_keepalive(2, 1);
+    EXPECT_TRUE(m.try_begin_keepalive(2, 1));
+
+    EXPECT_FALSE(m.take_resolution_handoff(0)) << "no hand-off pending";
+    m.note_resolution_handoff(0); // an old leg stopped with a want pending
+    EXPECT_TRUE(m.take_resolution_handoff(0));
+    EXPECT_FALSE(m.take_resolution_handoff(0)) << "taken once";
+}
+
 // Copilot review on #7: with a single member, replacing it leaves no eligible reader. A read that finds no eligible
 // member drives keep_alives, so a later read is admitted without a write, flush or probe in between.
 TEST(CraftClient, ReadAfterReplacingTheOnlyMemberRecoversWithoutAWrite) {

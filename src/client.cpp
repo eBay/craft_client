@@ -295,20 +295,23 @@ static async_status fire_resolution(::io_uring* q, std::shared_ptr< craft_replic
                                     std::shared_ptr< read_route_map > route) {
     for (;;) {
         while (auto const want = tracker->resolution_want()) {
-            if (route->generation(idx) != gen) break; // replaced: leave the want for the current backend
+            if (route->generation(idx) != gen) { // replaced: hand the want to the slot's current backend
+                route->note_resolution_handoff(idx);
+                break;
+            }
             client_hdr const hdr{term, tracker->frontier(), route->all_committed()};
             auto r = co_await h->request_resolution(q, hdr, *want);
             if (!r.has_value()) { // NOT_LEADER / down / stale: this peer cannot resolve; leave the want alone
-                route->end_resolution(idx);
+                route->end_resolution(idx, gen);
                 co_return ok();
             }
             tracker->retire_upto(r->resolved_upto, r->empty_slots, [&](int64_t d) { route->note_filled(d, idx, gen); });
             tracker->clear_resolution_want(r->resolved_upto);
         }
-        route->end_resolution(idx);
+        route->end_resolution(idx, gen);
         // Close the note-then-begin race: a want recorded between our last peek and the flag release would
         // strand until the next failure. Reclaim this peer's flag only if a want is actually pending.
-        if (route->generation(idx) != gen || !tracker->resolution_want() || !route->try_begin_resolution(idx))
+        if (route->generation(idx) != gen || !tracker->resolution_want() || !route->try_begin_resolution(idx, gen))
             co_return ok();
     }
 }
@@ -322,7 +325,7 @@ void craft_client::request_resolution_round(::io_uring* q, int64_t upto) {
     // Each leg rides the failing write's ring, so its resumptions stay on that queue's reap thread.
     auto const ms = members();
     for (std::size_t m = 0; m < ms->backends.size(); ++m) {
-        if (route_->try_begin_resolution(m))
+        if (route_->try_begin_resolution(m, ms->gens[m]))
             fire_resolution(q, ms->backends[m], m, term_, ms->gens[m], tracker_, route_).detach();
     }
 }
@@ -445,7 +448,7 @@ static async_status fire_keepalive(::io_uring* q, std::shared_ptr< craft_replica
                                    std::shared_ptr< read_route_map > route, std::size_t idx, uint64_t gen) {
     auto r = co_await h->keep_alive(q, hdr);
     if (r.has_value()) route->advance_synced(idx, gen, r->commit_lsn);
-    route->end_keepalive(idx);
+    route->end_keepalive(idx, gen);
     co_return ok();
 }
 
@@ -460,7 +463,18 @@ void craft_client::drive_keepalives(::io_uring* q, std::size_t exclude_idx) {
         // per queue -- liveness needs ONE keep_alive per member -- so under blk-mq whichever queue thread wins
         // the flag fires the leg, which then rides (and resumes on) THAT queue's ring; everything the detached
         // leg touches (advance_synced, the flag itself) is atomic/lock-guarded in the router.
-        if (route_->try_begin_keepalive(m)) fire_keepalive(q, ms->backends[m], hdr, route_, m, ms->gens[m]).detach();
+        if (route_->try_begin_keepalive(m, ms->gens[m]))
+            fire_keepalive(q, ms->backends[m], hdr, route_, m, ms->gens[m]).detach();
+    }
+    // Hand-off after a replace_member: a resolution leg to the slot's OLD backend stops at the generation change
+    // and, if a want is still pending, marks the slot. Fire that slot's CURRENT backend here so the want does not
+    // wait for the next failed write (which matters if the new member is the leader). Only replaced slots are
+    // re-driven; any other dead round still re-fires on the next failure, as before.
+    for (std::size_t m = 0; m < ms->backends.size(); ++m) {
+        if (!route_->take_resolution_handoff(m)) continue;
+        if (!tracker_->resolution_want()) continue;
+        if (route_->try_begin_resolution(m, ms->gens[m]))
+            fire_resolution(q, ms->backends[m], m, term_, ms->gens[m], tracker_, route_).detach();
     }
 }
 

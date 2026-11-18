@@ -135,8 +135,9 @@ public:
             gen_[i].store(0, std::memory_order_relaxed);
             floor_[i].store(login_dlsn, std::memory_order_relaxed);  // a member serves reads once synced >= this
             synced_[i].store(k_unsynced, std::memory_order_relaxed); // raised per-member from its real commit_lsn
-            ka_inflight_[i].store(false, std::memory_order_relaxed);
-            rr_inflight_[i].store(false, std::memory_order_relaxed);
+            ka_inflight_[i].store(0, std::memory_order_relaxed);
+            rr_inflight_[i].store(0, std::memory_order_relaxed);
+            rr_handoff_[i].store(false, std::memory_order_relaxed);
         }
         all_committed_.store(k_unsynced, std::memory_order_relaxed); // min synced_; rises as members report in
         {
@@ -379,15 +380,28 @@ public:
     // drive. try_begin_keepalive returns true iff the caller may fire one (none already in flight for `idx`);
     // the completion MUST call end_keepalive to release. This lives in the route map, not the client, because a
     // detached keep_alive outlives the client (it captures this map's shared_ptr) and clears the flag here.
-    bool try_begin_keepalive(std::size_t idx) { return !ka_inflight_[idx].exchange(true, std::memory_order_acq_rel); }
-    void end_keepalive(std::size_t idx) { ka_inflight_[idx].store(false, std::memory_order_release); }
+    //
+    // Both gates are GENERATION-scoped: a gate holds the generation (+1) of the backend whose leg owns it. A leg to
+    // a newer backend of the slot (after replace_member) may start while one to the replaced backend is still
+    // outstanding, and the old leg's completion cannot release the new leg's gate. Without that, a leg stuck on
+    // the old member would block the new member's keep_alive (delaying its catch-up) or resolution (pinning the
+    // frontier if the new member is the leader).
+    bool try_begin_keepalive(std::size_t idx, uint64_t gen = 0) { return try_begin(ka_inflight_[idx], gen); }
+    void end_keepalive(std::size_t idx, uint64_t gen = 0) { end(ka_inflight_[idx], gen); }
 
     // The identical collapse for the client-requested resolution round: at most ONE outstanding
     // request_resolution per member. A burst of failed in-flight writes tops a peer up again only once its
     // previous request completed, never one request per failure (the want watermark in dlsn_tracker is what
     // accumulates the burst).
-    bool try_begin_resolution(std::size_t idx) { return !rr_inflight_[idx].exchange(true, std::memory_order_acq_rel); }
-    void end_resolution(std::size_t idx) { rr_inflight_[idx].store(false, std::memory_order_release); }
+    bool try_begin_resolution(std::size_t idx, uint64_t gen = 0) { return try_begin(rr_inflight_[idx], gen); }
+    void end_resolution(std::size_t idx, uint64_t gen = 0) { end(rr_inflight_[idx], gen); }
+    // A leg to a replaced backend stopped with a resolution want still pending: the client's next keep_alive drive
+    // fires the slot's current backend (take_ clears the mark).
+    void note_resolution_handoff(std::size_t idx) { rr_handoff_[idx].store(true, std::memory_order_release); }
+    bool take_resolution_handoff(std::size_t idx) {
+        return rr_handoff_[idx].load(std::memory_order_acquire) &&
+            rr_handoff_[idx].exchange(false, std::memory_order_acq_rel);
+    }
 
     // Observability / tests.
     int64_t folded() const { return folded_.load(std::memory_order_acquire); }
@@ -442,10 +456,28 @@ private:
         floor_{}; // per member: synced_ must reach this to serve reads (L; J after a mid-session replace)
     std::array< std::atomic< uint64_t >, k_max_members >
         gen_{}; // per member: generation of the backend in this slot; replies from older generations are ignored
-    std::array< std::atomic< bool >, k_max_members >
+    // Per member: 0 = free, else (generation + 1) of the backend whose leg is outstanding.
+    std::array< std::atomic< uint64_t >, k_max_members >
         ka_inflight_{}; // per member: a keep_alive is outstanding (the one-per-leg collapse)
-    std::array< std::atomic< bool >, k_max_members >
+    std::array< std::atomic< uint64_t >, k_max_members >
         rr_inflight_{}; // per member: a request_resolution is outstanding (same collapse)
+    std::array< std::atomic< bool >, k_max_members >
+        rr_handoff_{}; // per member: a replaced backend's leg left a want for the current backend
+
+    // Take the gate for generation `gen`: free, or held by an OLDER generation (a replaced backend's leg).
+    static bool try_begin(std::atomic< uint64_t >& g, uint64_t gen) {
+        uint64_t const mine = gen + 1;
+        uint64_t cur = g.load(std::memory_order_acquire);
+        for (;;) {
+            if (cur >= mine) return false; // this generation (or a newer one) already has a leg out
+            if (g.compare_exchange_weak(cur, mine, std::memory_order_acq_rel, std::memory_order_acquire)) return true;
+        }
+    }
+    // Release only if the gate is still ours: a replaced backend's late completion leaves a newer leg's gate alone.
+    static void end(std::atomic< uint64_t >& g, uint64_t gen) {
+        uint64_t mine = gen + 1;
+        g.compare_exchange_strong(mine, 0, std::memory_order_release, std::memory_order_relaxed);
+    }
 
     std::mutex pending_mu_;                       // guards pending_
     std::vector< pending_miss > pending_;         // durable non-universal completed slots awaiting fold
