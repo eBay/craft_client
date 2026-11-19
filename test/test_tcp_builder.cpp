@@ -20,6 +20,7 @@
 
 #include <cstring>
 #include <memory>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -107,4 +108,12 @@ TEST(CraftTcpBuilder, ReplaceTcpMemberSwapsTheBackendInPlace) {
     auto const again = replace_tcp_member(cluster, members[0].id, {members[0].id, "127.0.0.3:9200"});
     ASSERT_NE(again, nullptr) << "keeping the slot's own id is allowed";
     EXPECT_EQ(backends(cluster)[0], again);
+
+    // A malformed "host:port" throws, as documented (like make_tcp_cluster), and leaves the cluster unchanged;
+    // ublkpp's craft_disk::replace_member turns it into invalid_argument.
+    auto const before_bad = backends(cluster);
+    for (char const* bad : {"127.0.0.4", "127.0.0.4:", ":9000", "host:90x", "host:0", "host:65536", "host:123456"})
+        EXPECT_THROW((void)replace_tcp_member(cluster, members[0].id, {members[0].id, bad}), std::invalid_argument)
+            << bad;
+    EXPECT_EQ(backends(cluster), before_bad);
 }

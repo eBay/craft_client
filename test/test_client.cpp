@@ -1137,6 +1137,7 @@ public:
     std::atomic< int > writes{0};
     std::atomic< int > reads{0};
     std::atomic< int > resolutions{0};
+    std::atomic< uint64_t > resolution_token{0}; // client_token of the last request_resolution header
     std::mutex mu;
     std::vector< int64_t > dlsns; // every dLSN this backend was sent, in arrival order
 
@@ -1159,6 +1160,7 @@ public:
     async_result< lsn_pair > keep_alive(::io_uring* q, client_hdr hdr) override { return inner_->keep_alive(q, hdr); }
     async_result< resolution_result > request_resolution(::io_uring* q, client_hdr hdr, int64_t upto) override {
         ++resolutions;
+        resolution_token = hdr.client_token;
         return inner_->request_resolution(q, hdr, upto);
     }
     peer_id_t id() const override { return inner_->id(); }
@@ -1222,17 +1224,24 @@ TEST(CraftClient, WritesRacingReplaceMemberAreNeverLost) {
     auto client = std::make_shared< craft::craft_client >(std::move(backends), 0);
     ASSERT_TRUE(rg(client->login(TOKEN)).has_value());
 
+    // Handshake: the swap starts once a quarter of the writes are done, and the writer cannot pass three quarters
+    // until the swap has returned -- so writes race replace_member in between, and the last quarter is guaranteed
+    // to be issued after it, on any schedule.
     constexpr int k_writes = 2000;
     std::atomic< bool > ok{true};
+    std::atomic< bool > swapped{false};
+    auto fresh = std::make_shared< counting_replica >(set.replicas[2]);
     std::thread writer([&] {
         for (int i = 0; i < k_writes; ++i) {
+            if (i == 3 * k_writes / 4)
+                while (!swapped.load(std::memory_order_acquire)) {}
             auto buf = page_of(static_cast< uint8_t >(i));
             if (!wr(*client, static_cast< uint64_t >(i % 64), buf)) ok = false;
         }
     });
     while (legs[0]->writes.load() < k_writes / 4) {}
-    auto fresh = std::make_shared< counting_replica >(set.replicas[2]);
-    ASSERT_FALSE(client->replace_member(set.replicas[2]->id(), fresh));
+    EXPECT_FALSE(client->replace_member(set.replicas[2]->id(), fresh));
+    swapped.store(true, std::memory_order_release);
     writer.join();
     ASSERT_TRUE(ok.load());
 
@@ -1294,6 +1303,7 @@ TEST(CraftClient, AWantPendingAcrossASwapReachesTheNewBackend) {
     ASSERT_FALSE(cl.client->replace_member(cl.set.replicas[0]->id(), fresh));
     ASSERT_TRUE(wr(*cl.client, 8, v2)); // a healthy write: picks up the hand-off
     EXPECT_GT(fresh->resolutions.load(), 0) << "the pending want reached the new backend";
+    EXPECT_EQ(fresh->resolution_token.load(), TOKEN) << "with the session's client_token, which its HELO presents";
     ASSERT_TRUE(rg(cl.client->flush(nullptr)).has_value());
     EXPECT_EQ(cl.client->commit_lsn(), 2) << "the frontier is no longer pinned";
 }

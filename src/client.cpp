@@ -299,8 +299,10 @@ std::error_condition craft_client::replace_member(peer_id_t const& old_id, std::
 // credit the new member with what the old one resolved. On EVERY exit after a replace, a want still pending is
 // handed to the slot's current backend (note_resolution_handoff; fired by the next write or keep_alive drive), so
 // it never waits for another failed write -- which may not come on a healthy cluster.
+// `client_token` goes in every request header like every other op's (make_hdr): a leg can be a fresh proxy's FIRST
+// op (a hand-off to a just-swapped backend), and its on-ring HELO presents the header's token as the session owner.
 static async_status fire_resolution(::io_uring* q, std::shared_ptr< craft_replica > h, std::size_t idx, uint64_t term,
-                                    uint64_t gen, std::shared_ptr< dlsn_tracker > tracker,
+                                    uint64_t client_token, uint64_t gen, std::shared_ptr< dlsn_tracker > tracker,
                                     std::shared_ptr< read_route_map > route) {
     auto handoff_if_replaced = [&] {
         if (route->generation(idx) != gen && tracker->resolution_want()) route->note_resolution_handoff(idx);
@@ -308,7 +310,7 @@ static async_status fire_resolution(::io_uring* q, std::shared_ptr< craft_replic
     for (;;) {
         while (auto const want = tracker->resolution_want()) {
             if (route->generation(idx) != gen) break; // replaced: hand off below
-            client_hdr const hdr{term, tracker->frontier(), route->all_committed()};
+            client_hdr const hdr{term, tracker->frontier(), route->all_committed(), client_token};
             auto r = co_await h->request_resolution(q, hdr, *want);
             if (!r.has_value()) { // NOT_LEADER / down / stale: this peer cannot resolve; leave the want alone
                 route->end_resolution(idx, gen);
@@ -337,7 +339,7 @@ void craft_client::request_resolution_round(::io_uring* q, int64_t upto) {
     auto const ms = members();
     for (std::size_t m = 0; m < ms->backends.size(); ++m) {
         if (route_->try_begin_resolution(m, ms->gens[m]))
-            fire_resolution(q, ms->backends[m], m, term_, ms->gens[m], tracker_, route_).detach();
+            fire_resolution(q, ms->backends[m], m, term_, client_token_, ms->gens[m], tracker_, route_).detach();
     }
 }
 
@@ -490,7 +492,7 @@ void craft_client::kick_resolution_handoffs(::io_uring* q, member_set const* ms)
         if (!route_->take_resolution_handoff(m)) continue;
         if (!tracker_->resolution_want()) continue;
         if (route_->try_begin_resolution(m, ms->gens[m]))
-            fire_resolution(q, ms->backends[m], m, term_, ms->gens[m], tracker_, route_).detach();
+            fire_resolution(q, ms->backends[m], m, term_, client_token_, ms->gens[m], tracker_, route_).detach();
     }
 }
 

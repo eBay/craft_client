@@ -19,10 +19,12 @@
 // Teardown drains each proxy's in-flight ops off the shared session-mgr thread before any proxy drops (see
 // tcp_set.hpp for the same rule the reference server-side set uses).
 
+#include <algorithm>
 #include <array>
 #include <chrono>
 #include <cstring>
 #include <mutex>
+#include <stdexcept>
 #include <string>
 
 #include <craft/tcp.hpp>
@@ -35,9 +37,17 @@ namespace {
 std::shared_ptr< CraftTcpReplica > make_proxy(replica_endpoint const& m, std::array< uint8_t, 16 > const& vol,
                                               std::chrono::milliseconds op_timeout) {
     auto const colon = m.addr.rfind(':'); // rfind so an IPv6-ish host with colons keeps only the last field
-    auto const host = m.addr.substr(0, colon);
-    auto const port = static_cast< uint16_t >(std::stoul(m.addr.substr(colon + 1)));
-    return std::make_shared< CraftTcpReplica >(host, port, m.id, vol, op_timeout, m.credential);
+    auto const bad = [&m] { return std::invalid_argument("craft: malformed replica address \"" + m.addr + "\""); };
+    if (colon == std::string::npos || colon == 0) throw bad(); // no ":port", or no host
+    auto const port_str = m.addr.substr(colon + 1);
+    // Strict: all digits, 1..65535. std::stoul alone would accept "9000x" or turn "10.0.0.1" into port 10.
+    if (port_str.empty() || port_str.size() > 5 ||
+        !std::all_of(port_str.begin(), port_str.end(), [](char c) { return c >= '0' && c <= '9'; }))
+        throw bad();
+    auto const port = std::stoul(port_str);
+    if (port == 0 || port > 65535) throw bad();
+    return std::make_shared< CraftTcpReplica >(m.addr.substr(0, colon), static_cast< uint16_t >(port), m.id, vol,
+                                               op_timeout, m.credential);
 }
 } // namespace
 
