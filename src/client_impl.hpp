@@ -42,10 +42,14 @@ class craft_client {
 public:
     craft_client(std::vector< std::shared_ptr< craft_replica > > replicas, uint32_t leader = 0,
                  uint32_t max_inflight = 128) :
-            members_(std::make_shared< member_set const >(
-                member_set{replicas, std::vector< uint64_t >(replicas.size(), 0)})),
+            n_(replicas.size()),
+            quorum_(replicas.size() / 2 + 1),
             leader_(leader),
-            tracker_(std::make_shared< dlsn_tracker >(max_inflight)) {}
+            tracker_(std::make_shared< dlsn_tracker >(max_inflight)) {
+        member_sets_.push_back(
+            std::make_unique< member_set const >(member_set{std::move(replicas), std::vector< uint64_t >(n_, 0)}));
+        members_.store(member_sets_.back().get(), std::memory_order_release);
+    }
 
     // Mid-session verbs carry the caller's queue ring (`q`, null = the blocking tier) straight through to every
     // backend leg they fan out -- one IO's whole leg chain rides one ring, so its resumptions all land back on
@@ -71,7 +75,7 @@ public:
     bool route_caught_up(std::size_t idx) const { return route_->caught_up(idx); }
     int64_t all_committed_lsn() const { return route_->all_committed(); }
     tracker_stats dlsn_stats(std::size_t sample_limit = 16) const { return tracker_->stats(sample_limit); }
-    std::size_t replica_count() const { return members()->backends.size(); }
+    std::size_t replica_count() const { return n_; }
     std::vector< peer_id_t > member_ids() const {
         auto const ms = members();
         std::vector< peer_id_t > ids;
@@ -84,7 +88,7 @@ public:
 
 private:
     client_hdr make_hdr() const;
-    std::size_t quorum() const { return members()->backends.size() / 2 + 1; }
+    std::size_t quorum() const { return quorum_; }
     // Trim the router's overlay from the WRITE path, exactly as dlsn_tracker batch-truncates its own
     // StreamTracker on resolve (k_trunc_batch). Without this, read_route_map::fold_to() is reached ONLY from
     // read(), so a write-only stream grows the overlay without bound and the first read after a burst pays to
@@ -109,9 +113,20 @@ private:
         std::vector< std::shared_ptr< craft_replica > > backends;
         std::vector< uint64_t > gens;
     };
-    std::shared_ptr< member_set const > members() const { return members_.load(std::memory_order_acquire); }
-    std::atomic< std::shared_ptr< member_set const > > members_;
-    std::mutex replace_mu_; // serializes replace_member against itself and against login's router reset
+    //
+    // A raw atomic pointer, not atomic<shared_ptr>: libstdc++ implements the latter with a lock bit on the control
+    // word, so every IO's load would contend on one cache line across all blk-mq queues. Every set ever published
+    // is owned by member_sets_ for the client's lifetime instead (moves are rare and a set is a few pointers), so a
+    // loaded pointer never dangles. Ops that outlive the client (detached legs) copy the backend shared_ptr out.
+    member_set const* members() const { return members_.load(std::memory_order_acquire); }
+    void kick_resolution_handoffs(::io_uring* q, member_set const* ms);
+    std::size_t const n_;      // member count: fixed for the client's life (a move replaces, never adds/removes)
+    std::size_t const quorum_; // n_ / 2 + 1
+    std::atomic< member_set const* > members_{nullptr};
+    std::vector< std::unique_ptr< member_set const > > member_sets_; // owns every published set; replace_mu_
+    // Serializes replace_member against itself. login() does not (and cannot: it co_awaits) take it: calling
+    // replace_member concurrently with login/logout is a contract violation (see client.hpp), not serialized here.
+    std::mutex replace_mu_;
     uint32_t leader_{0};
     uint64_t term_{0};
     uint64_t client_token_{0};

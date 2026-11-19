@@ -183,6 +183,7 @@ async_result< size_t > craft_client::write(::io_uring* q, uint64_t addr, uint64_
     // then reads the highest reserved dLSN J, so every dLSN above J is sent to the new backend.
     auto const ms = members_.load(std::memory_order_seq_cst); // seq_cst: see dlsn_tracker::reserve()
     auto const& replicas = ms->backends;
+    kick_resolution_handoffs(q, ms); // a want left pending by a member swap (write-only queues need this too)
 
     // Ack at quorum, not at the slowest replica: a straggler must not cost every write the transport's timeout.
     // Stragglers keep running detached, so each replica op must have consumed `data` by its first suspension
@@ -268,12 +269,18 @@ std::error_condition craft_client::replace_member(peer_id_t const& old_id, std::
         if (i != idx && cur->backends[i]->id() == backend->id())
             return make_error_condition(std::errc::invalid_argument);
 
-    auto next = std::make_shared< member_set >(*cur);
+    auto next = std::make_unique< member_set >(*cur);
     next->backends[idx] = std::move(backend);
     ++next->gens[idx];
-    route_->begin_replace(idx, next->gens[idx]);
-    members_.store(std::move(next), std::memory_order_seq_cst);
+    member_set const* const published = next.get();
+    member_sets_.push_back(std::move(next));
+    route_->begin_replace(idx, published->gens[idx]);
+    members_.store(published, std::memory_order_seq_cst);
     route_->finish_replace(idx, tracker_->issued());
+    // A resolution want pending across the swap (a round that died before it, or one whose only live leg was to
+    // the old backend) must reach the new backend without waiting for another failed write: mark the slot so the
+    // next write or keep_alive drive fires it.
+    if (tracker_->resolution_want()) route_->note_resolution_handoff(idx);
     return {};
 }
 
@@ -289,26 +296,30 @@ std::error_condition craft_client::replace_member(peer_id_t const& old_id, std::
 //
 // `gen` is the generation of `h` in slot `idx`. A leg whose backend has been replaced (replace_member) stops at the
 // next request instead of draining wants above the replace point against the OLD member, and note_filled does not
-// credit the new member with what the old one resolved; the next failed write fires a leg to the current backend.
+// credit the new member with what the old one resolved. On EVERY exit after a replace, a want still pending is
+// handed to the slot's current backend (note_resolution_handoff; fired by the next write or keep_alive drive), so
+// it never waits for another failed write -- which may not come on a healthy cluster.
 static async_status fire_resolution(::io_uring* q, std::shared_ptr< craft_replica > h, std::size_t idx, uint64_t term,
                                     uint64_t gen, std::shared_ptr< dlsn_tracker > tracker,
                                     std::shared_ptr< read_route_map > route) {
+    auto handoff_if_replaced = [&] {
+        if (route->generation(idx) != gen && tracker->resolution_want()) route->note_resolution_handoff(idx);
+    };
     for (;;) {
         while (auto const want = tracker->resolution_want()) {
-            if (route->generation(idx) != gen) { // replaced: hand the want to the slot's current backend
-                route->note_resolution_handoff(idx);
-                break;
-            }
+            if (route->generation(idx) != gen) break; // replaced: hand off below
             client_hdr const hdr{term, tracker->frontier(), route->all_committed()};
             auto r = co_await h->request_resolution(q, hdr, *want);
             if (!r.has_value()) { // NOT_LEADER / down / stale: this peer cannot resolve; leave the want alone
                 route->end_resolution(idx, gen);
+                handoff_if_replaced(); // e.g. OUT, being moved away, errors after the swap
                 co_return ok();
             }
             tracker->retire_upto(r->resolved_upto, r->empty_slots, [&](int64_t d) { route->note_filled(d, idx, gen); });
             tracker->clear_resolution_want(r->resolved_upto);
         }
         route->end_resolution(idx, gen);
+        handoff_if_replaced();
         // Close the note-then-begin race: a want recorded between our last peek and the flag release would
         // strand until the next failure. Reclaim this peer's flag only if a want is actually pending.
         if (route->generation(idx) != gen || !tracker->resolution_want() || !route->try_begin_resolution(idx, gen))
@@ -466,11 +477,16 @@ void craft_client::drive_keepalives(::io_uring* q, std::size_t exclude_idx) {
         if (route_->try_begin_keepalive(m, ms->gens[m]))
             fire_keepalive(q, ms->backends[m], hdr, route_, m, ms->gens[m]).detach();
     }
-    // Hand-off after a replace_member: a resolution leg to the slot's OLD backend stops at the generation change
-    // and, if a want is still pending, marks the slot. Fire that slot's CURRENT backend here so the want does not
-    // wait for the next failed write (which matters if the new member is the leader). Only replaced slots are
-    // re-driven; any other dead round still re-fires on the next failure, as before.
-    for (std::size_t m = 0; m < ms->backends.size(); ++m) {
+    kick_resolution_handoffs(q, ms);
+}
+
+// Hand-off after a replace_member: a want pending across the swap marks the replaced slot (replace_member itself,
+// or a resolution leg to the slot's OLD backend on its way out). Fire that slot's CURRENT backend so the want does
+// not wait for the next failed write (which matters if the new member is the leader). Only replaced slots are
+// re-driven; any other dead round still re-fires on the next failure, as before. Called from every write and every
+// keep_alive drive, so a write-only queue picks it up too; with nothing marked it is n relaxed loads.
+void craft_client::kick_resolution_handoffs(::io_uring* q, member_set const* ms) {
+    for (std::size_t m = 0; m < n_; ++m) {
         if (!route_->take_resolution_handoff(m)) continue;
         if (!tracker_->resolution_want()) continue;
         if (route_->try_begin_resolution(m, ms->gens[m]))

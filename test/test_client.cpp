@@ -25,7 +25,9 @@
 #include <chrono>
 #include <cstdint>
 #include <memory>
+#include <mutex>
 #include <optional>
+#include <set>
 #include <thread>
 #include <vector>
 
@@ -1030,9 +1032,9 @@ TEST(ReadRouteMap, ReplaceMemberGatesReadsOnTheReplacePoint) {
     EXPECT_EQ(m.generation(2), 1u);
 }
 
-// Copilot review on #7: an old member's missed write that folds AFTER the new member proved commit_lsn >= J must
-// not strand it. Folding no longer records a miss at or below a member's own commit_lsn, and eligibility (c)
-// treats an overlay slot at or below it as held.
+// A member that proved commit_lsn >= J is not stranded by an old member's missed write that folds afterwards: the
+// fold records no miss at or below a member's own commit_lsn, and eligibility (c) treats an overlay slot at or
+// below it as held.
 TEST(ReadRouteMap, ReplacedMemberCaughtUpBeforeTheFoldIsNotStranded) {
     craft::read_route_map m;
     m.reset(3, /*L=*/-1);
@@ -1059,7 +1061,7 @@ TEST(ReadRouteMap, ReplacedMemberCaughtUpBeforeTheFoldIsNotStranded) {
     EXPECT_TRUE(m.eligible(2, blk(1), PAGE, 1));
 }
 
-// Copilot review on #7: a resolution leg still running against the OLD backend must not credit the new member.
+// A resolution leg still running against the OLD backend of a slot does not credit the slot's new member.
 TEST(ReadRouteMap, ResolutionByAReplacedBackendDoesNotCreditTheNewMember) {
     craft::read_route_map m;
     m.reset(3, /*L=*/-1);
@@ -1079,7 +1081,7 @@ TEST(ReadRouteMap, ResolutionByAReplacedBackendDoesNotCreditTheNewMember) {
     EXPECT_TRUE(m.eligible(2, blk(0), PAGE, 0));
 }
 
-// Copilot review on #7: the per-leg gates are generation-scoped. A leg still out to a replaced backend neither
+// The per-leg gates are generation-scoped: a leg still out to a replaced backend neither
 // blocks a leg to the slot's new backend nor, when it completes, releases the new leg's gate.
 TEST(ReadRouteMap, LegGatesAreGenerationScoped) {
     craft::read_route_map m;
@@ -1107,7 +1109,7 @@ TEST(ReadRouteMap, LegGatesAreGenerationScoped) {
     EXPECT_FALSE(m.take_resolution_handoff(0)) << "taken once";
 }
 
-// Copilot review on #7: with a single member, replacing it leaves no eligible reader. A read that finds no eligible
+// With a single member, replacing it leaves no eligible reader. A read that finds no eligible
 // member drives keep_alives, so a later read is admitted without a write, flush or probe in between.
 TEST(CraftClient, ReadAfterReplacingTheOnlyMemberRecoversWithoutAWrite) {
     auto set = craft::make_mem_replica_group(boost::uuids::random_generator()(), 1, PAGE);
@@ -1134,12 +1136,19 @@ public:
     explicit counting_replica(std::shared_ptr< craft::craft_replica > inner) : inner_{std::move(inner)} {}
     std::atomic< int > writes{0};
     std::atomic< int > reads{0};
+    std::atomic< int > resolutions{0};
+    std::mutex mu;
+    std::vector< int64_t > dlsns; // every dLSN this backend was sent, in arrival order
 
     async_result< LoginResult > login(uint64_t client_token) override { return inner_->login(client_token); }
     async_status logout(client_hdr hdr) override { return inner_->logout(hdr); }
     async_result< lsn_pair > write(::io_uring* q, client_hdr hdr, int64_t dlsn, uint64_t addr, uint64_t len,
                                    sisl::sg_list data) override {
         ++writes;
+        {
+            std::lock_guard< std::mutex > g{mu};
+            dlsns.push_back(dlsn);
+        }
         return inner_->write(q, hdr, dlsn, addr, len, std::move(data));
     }
     async_result< read_result > read(::io_uring* q, client_hdr hdr, int64_t read_lsn, uint64_t addr, uint64_t len,
@@ -1149,6 +1158,7 @@ public:
     }
     async_result< lsn_pair > keep_alive(::io_uring* q, client_hdr hdr) override { return inner_->keep_alive(q, hdr); }
     async_result< resolution_result > request_resolution(::io_uring* q, client_hdr hdr, int64_t upto) override {
+        ++resolutions;
         return inner_->request_resolution(q, hdr, upto);
     }
     peer_id_t id() const override { return inner_->id(); }
@@ -1197,6 +1207,95 @@ TEST(CraftClient, ReplaceMemberRoutesAroundTheNewMemberUntilItCatchesUp) {
     for (int i = 0; i < 6; ++i)
         EXPECT_EQ(rd(*client, 4), b);
     EXPECT_GT(fresh->reads.load(), 0) << "once caught up it serves reads again (rotating start)";
+}
+
+// Every write lands on the old backend or the new one, and every dLSN above the old backend's last one reaches the
+// new backend: the reserve -> publish -> issued() handshake, exercised with a writer thread racing replace_member.
+TEST(CraftClient, WritesRacingReplaceMemberAreNeverLost) {
+    auto set = craft::make_mem_replica_group(boost::uuids::random_generator()(), 3, PAGE);
+    std::vector< std::shared_ptr< counting_replica > > legs;
+    std::vector< std::shared_ptr< craft::craft_replica > > backends;
+    for (auto const& r : set.replicas) {
+        legs.push_back(std::make_shared< counting_replica >(r));
+        backends.push_back(legs.back());
+    }
+    auto client = std::make_shared< craft::craft_client >(std::move(backends), 0);
+    ASSERT_TRUE(rg(client->login(TOKEN)).has_value());
+
+    constexpr int k_writes = 2000;
+    std::atomic< bool > ok{true};
+    std::thread writer([&] {
+        for (int i = 0; i < k_writes; ++i) {
+            auto buf = page_of(static_cast< uint8_t >(i));
+            if (!wr(*client, static_cast< uint64_t >(i % 64), buf)) ok = false;
+        }
+    });
+    while (legs[0]->writes.load() < k_writes / 4) {}
+    auto fresh = std::make_shared< counting_replica >(set.replicas[2]);
+    ASSERT_FALSE(client->replace_member(set.replicas[2]->id(), fresh));
+    writer.join();
+    ASSERT_TRUE(ok.load());
+
+    std::set< int64_t > out(legs[2]->dlsns.begin(), legs[2]->dlsns.end());
+    std::set< int64_t > in(fresh->dlsns.begin(), fresh->dlsns.end());
+    ASSERT_FALSE(out.empty());
+    ASSERT_FALSE(in.empty()) << "the swap happened mid-stream";
+    int64_t const last = *std::max_element(legs[0]->dlsns.begin(), legs[0]->dlsns.end());
+    int64_t const out_max = *out.rbegin();
+    for (int64_t d = 0; d <= last; ++d) {
+        EXPECT_TRUE(out.count(d) || in.count(d)) << "dLSN " << d << " reached neither the old nor the new backend";
+        if (d > out_max) EXPECT_TRUE(in.count(d)) << "dLSN " << d << " is above the old backend's last write";
+    }
+}
+
+// The new member really lags: an empty replica of the same volume that never received the old writes. It stays
+// out of reads (its commit_lsn never reaches J), reads keep returning the data from the other members, and writes
+// keep succeeding on the remaining quorum.
+TEST(CraftClient, ALaggingReplacementIsKeptOutOfReads) {
+    auto const vid = boost::uuids::random_generator()();
+    auto set = craft::make_mem_replica_group(vid, 3, PAGE);
+    std::vector< std::shared_ptr< craft::craft_replica > > backends(set.replicas.begin(), set.replicas.end());
+    auto client = std::make_shared< craft::craft_client >(std::move(backends), 0);
+    ASSERT_TRUE(rg(client->login(TOKEN)).has_value());
+    auto a = page_of(0xD1);
+    for (uint64_t b = 0; b < 4; ++b)
+        ASSERT_TRUE(wr(*client, b, a));
+
+    // A fresh, empty replica of the volume with an id no current member has (index 3 of a separate group).
+    auto empty_group = craft::make_mem_replica_group(vid, 4, PAGE);
+    auto lagging = std::make_shared< counting_replica >(empty_group.replicas[3]);
+    ASSERT_FALSE(client->replace_member(set.replicas[2]->id(), lagging));
+
+    auto b2 = page_of(0xD2);
+    ASSERT_TRUE(wr(*client, 5, b2)) << "A and B still make the quorum";
+    ASSERT_TRUE(rg(client->flush(nullptr)).has_value());
+    for (int i = 0; i < 6; ++i) {
+        EXPECT_EQ(rd(*client, static_cast< uint64_t >(i % 4)), a);
+        EXPECT_EQ(rd(*client, 5), b2);
+    }
+    EXPECT_FALSE(client->route_caught_up(2)) << "below the replace point";
+    EXPECT_EQ(lagging->reads.load(), 0) << "no read is routed to a member that lacks the data";
+}
+
+// A resolution want pending across a swap reaches the slot's NEW backend without another failed write. Here the
+// round died with the leader down (write_subquorum_unhealed), so without a swap the frontier stays pinned (see
+// N3_AckedOverwriteShadowsAFailedWrite); swapping the leader's slot hands the want to the new backend, and the next
+// write fires it.
+TEST(CraftClient, AWantPendingAcrossASwapReachesTheNewBackend) {
+    auto cl = make_cluster(3);
+    auto v0 = page_of(0x50);
+    auto v1 = page_of(0x51);
+    auto v2 = page_of(0x52);
+    ASSERT_TRUE(wr(*cl.client, 7, v0));  // dLSN 0
+    write_subquorum_unhealed(cl, 7, v1); // dLSN 1: failed, round dead, want pending
+    ASSERT_EQ(cl.client->commit_lsn(), 0) << "pinned by the unresolved slot";
+
+    auto fresh = std::make_shared< counting_replica >(cl.set.replicas[0]); // the leader's slot, new proxy
+    ASSERT_FALSE(cl.client->replace_member(cl.set.replicas[0]->id(), fresh));
+    ASSERT_TRUE(wr(*cl.client, 8, v2)); // a healthy write: picks up the hand-off
+    EXPECT_GT(fresh->resolutions.load(), 0) << "the pending want reached the new backend";
+    ASSERT_TRUE(rg(cl.client->flush(nullptr)).has_value());
+    EXPECT_EQ(cl.client->commit_lsn(), 2) << "the frontier is no longer pinned";
 }
 
 TEST(CraftClient, ReplaceMemberRejectsBadArguments) {
