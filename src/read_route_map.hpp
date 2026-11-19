@@ -132,9 +132,12 @@ public:
                 miss_[i].clear();
         }
         for (std::size_t i = 0; i < n; ++i) {
+            gen_[i].store(0, std::memory_order_relaxed);
+            floor_[i].store(login_dlsn, std::memory_order_relaxed);  // a member serves reads once synced >= this
             synced_[i].store(k_unsynced, std::memory_order_relaxed); // raised per-member from its real commit_lsn
-            ka_inflight_[i].store(false, std::memory_order_relaxed);
-            rr_inflight_[i].store(false, std::memory_order_relaxed);
+            ka_inflight_[i].store(0, std::memory_order_relaxed);
+            rr_inflight_[i].store(0, std::memory_order_relaxed);
+            rr_handoff_[i].store(false, std::memory_order_relaxed);
         }
         all_committed_.store(k_unsynced, std::memory_order_relaxed); // min synced_; rises as members report in
         {
@@ -229,8 +232,14 @@ public:
                 for (std::size_t i = 0; i < n_; ++i) {
                     if (e.held & bit(i))
                         miss_[i].erase(iv); // holds the latest folded write on this range -> not missing
-                    else
+                    else if (e.dlsn > synced_[i].load(std::memory_order_acquire))
                         miss_[i].set(std::make_pair(iv, e.dlsn)); // missed it -> missing there
+                    else
+                        // Not a holder by its op reply, but its own commit_lsn already covers e.dlsn (it applied
+                        // it via server-side resync -- or it is a member swapped in mid-session whose replace
+                        // point covers e.dlsn): it holds the write, so it is not missing. advance_synced only
+                        // erases on PROGRESS, so recording the miss here would strand a caught-up member.
+                        miss_[i].erase(iv);
                 }
             }
         }
@@ -243,13 +252,16 @@ public:
     //   (a) Synced >= L    -- the member has PROVEN (login / keep_alive / IO replies) it holds the committed
     //                         prefix up to the login frontier; a laggard seeded at the floor is excluded here;
     //   (b) below the frontier: no Missing byte-range overlapping [addr,len) (per-block precise); and
-    //   (c) above the frontier: it holds every DURABLE overlay slot in (folded, Hmax] overlapping the range.
+    //   (c) above the frontier: it holds every DURABLE overlay slot in (folded, Hmax] overlapping the range --
+    //       by its holder bit, or because the slot is at or below its own proven commit_lsn.
     // A slot with fewer than `quorum` holders is a sub-quorum / failed write, never a winner, so skipped in
     // (c) -- UNLESS a resolution round verdicted it durable (note_filled): then it is required even though
     // its recorded holder count is sub-quorum. Among durable slots (c) is still the "holds every overlap"
     // superset (safe for N=3 by quorum intersection); per-block gating there is a further refinement.
     bool eligible(std::size_t idx, uint64_t addr, uint64_t len, int64_t Hmax) {
-        if (synced_[idx].load(std::memory_order_acquire) < login_dlsn_) return false; // (a)
+        int64_t const synced = synced_[idx].load(std::memory_order_acquire);
+        if (synced < floor_[idx].load(std::memory_order_acquire))
+            return false; // (a): L, or the replace point J for a member swapped in mid-session
         {
             std::shared_lock< std::shared_mutex > mg{map_mu_};
             if (boost::icl::intersects(miss_[idx], byte_ivl(addr, len))) return false; // (b)
@@ -259,6 +271,9 @@ public:
         bool ok = true;
         overlay_->foreach_all_active(fold + 1, [&](int64_t d, route_slot& s) -> bool {
             if (d > Hmax) return false; // past the horizon; stop
+            // At or below the member's own commit_lsn it has applied every write, this one included, whatever
+            // its op reply said (e.g. the slot was acked by the member it replaced).
+            if (d <= synced) return true;
             uint64_t const held = std::atomic_ref< uint64_t >(s.holders).load(std::memory_order_acquire);
             bool const durable = (static_cast< std::size_t >(std::popcount(held)) >= quorum_) ||
                 (std::atomic_ref< uint8_t >(s.verdict).load(std::memory_order_acquire) != 0);
@@ -279,8 +294,14 @@ public:
     // once it folds -- exactly what a durable-but-non-universal completion would have handed over. Runs
     // before the tracker resolves the slot acked, so the fold (which chases the frontier) cannot pass `d`
     // without seeing the pending entry.
-    void note_filled(int64_t d, std::size_t leader_idx) {
-        uint64_t const lb = bit(leader_idx);
+    //
+    // `gen` is the generation of the backend that resolved it. If slot `leader_idx` has been replaced since,
+    // the copy is on the OLD member: the slot is still durable (verdict), but the new member is NOT credited.
+    // Serialized with begin_replace on fold_mu_, so a credit either lands before the replace (and is covered
+    // by the replace point J) or is refused.
+    void note_filled(int64_t d, std::size_t leader_idx, uint64_t gen) {
+        std::lock_guard< std::mutex > fg{fold_mu_};
+        uint64_t const lb = (gen == gen_[leader_idx].load(std::memory_order_relaxed)) ? bit(leader_idx) : 0;
         overlay_->update(d, [&](route_slot& s) -> bool {
             uint64_t const held = std::atomic_ref< uint64_t >(s.holders).fetch_or(lb, std::memory_order_seq_cst) | lb;
             std::atomic_ref< uint8_t >(s.verdict).store(1, std::memory_order_release);
@@ -302,12 +323,17 @@ public:
     // dormant until server-side resync fills the member's holes: a laggard's commit_lsn stalls just below its
     // first Missing hole, so nothing at/above that hole clears until resync fills it (then C passes it and the
     // erase fires). This is the sole place synced_ advances and the sole non-fold map mutation.
-    void advance_synced(std::size_t idx, int64_t C) {
+    //
+    // `gen` is the generation of the backend the reply came from (member_set::gens at issue). A reply from a
+    // member that has since been replaced carries an older generation and is ignored: it reports the OLD member's
+    // commit_lsn, which says nothing about the new one.
+    void advance_synced(std::size_t idx, uint64_t gen, int64_t C) {
         // Lock-free monotonic pre-check: every IO response piggybacks the member's watermarks now, so this is
         // fed from the write/read ack paths too, not just the detached keep_alives -- the no-news case must
         // stay a single atomic load.
         if (C <= synced_[idx].load(std::memory_order_acquire)) return;
         std::lock_guard< std::mutex > fg{fold_mu_};
+        if (gen != gen_[idx].load(std::memory_order_relaxed)) return; // from a replaced member
         if (C <= synced_[idx].load(std::memory_order_relaxed)) return;
         synced_[idx].store(C, std::memory_order_release);
         int64_t floor = synced_[0].load(std::memory_order_relaxed); // min commit_lsn across members
@@ -322,26 +348,67 @@ public:
             miss_[idx].erase(iv);
     }
 
+    // ── mid-session member replacement (craft::replace_member) ──
+    //
+    // Two steps around the publication of the new backend:
+    //   begin_replace(idx, gen): the slot now belongs to backend generation `gen`. Until finish_replace it serves no
+    //     read (floor = never); its synced_ restarts at the unsynced floor (which also pins all_committed_, the
+    //     reclaim floor, until the new member reports progress); its Missing map is cleared, since it described the
+    //     old member.
+    //   finish_replace(idx, J): J is the highest dLSN reserved by the time the new backend was published. Every
+    //     dLSN above J is broadcast to the new backend and tracked as usual; the new member is trusted for reads
+    //     only once its own commit_lsn reaches J, i.e. once server-side resync has given it everything up to J.
+    // Late completions from the old backend (dLSNs <= J) may still set this slot's holder bits; that is harmless,
+    // because the floor J already requires the new member to hold everything up to J itself.
+    void begin_replace(std::size_t idx, uint64_t gen) {
+        std::lock_guard< std::mutex > fg{fold_mu_};
+        gen_[idx].store(gen, std::memory_order_release);
+        floor_[idx].store(kNever, std::memory_order_release);
+        synced_[idx].store(k_unsynced, std::memory_order_release);
+        all_committed_.store(k_unsynced, std::memory_order_release);
+        std::unique_lock< std::shared_mutex > mg{map_mu_};
+        miss_[idx].clear();
+    }
+    void finish_replace(std::size_t idx, int64_t J) {
+        floor_[idx].store(std::max(J, login_dlsn_), std::memory_order_release);
+    }
+    uint64_t generation(std::size_t idx) const { return gen_[idx].load(std::memory_order_acquire); }
+    // After reset(): adopt the generation the client's member set holds for slot `idx` (it survives re-login).
+    void set_generation(std::size_t idx, uint64_t gen) { gen_[idx].store(gen, std::memory_order_release); }
+
     // At-most-one outstanding keep_alive per member (leg) -- the collapse for the client's timer-less keep_alive
     // drive. try_begin_keepalive returns true iff the caller may fire one (none already in flight for `idx`);
     // the completion MUST call end_keepalive to release. This lives in the route map, not the client, because a
     // detached keep_alive outlives the client (it captures this map's shared_ptr) and clears the flag here.
-    bool try_begin_keepalive(std::size_t idx) { return !ka_inflight_[idx].exchange(true, std::memory_order_acq_rel); }
-    void end_keepalive(std::size_t idx) { ka_inflight_[idx].store(false, std::memory_order_release); }
+    //
+    // Both gates are GENERATION-scoped: a gate holds the generation (+1) of the backend whose leg owns it. A leg to
+    // a newer backend of the slot (after replace_member) may start while one to the replaced backend is still
+    // outstanding, and the old leg's completion cannot release the new leg's gate. Without that, a leg stuck on
+    // the old member would block the new member's keep_alive (delaying its catch-up) or resolution (pinning the
+    // frontier if the new member is the leader).
+    bool try_begin_keepalive(std::size_t idx, uint64_t gen = 0) { return try_begin(ka_inflight_[idx], gen); }
+    void end_keepalive(std::size_t idx, uint64_t gen = 0) { end(ka_inflight_[idx], gen); }
 
     // The identical collapse for the client-requested resolution round: at most ONE outstanding
     // request_resolution per member. A burst of failed in-flight writes tops a peer up again only once its
     // previous request completed, never one request per failure (the want watermark in dlsn_tracker is what
     // accumulates the burst).
-    bool try_begin_resolution(std::size_t idx) { return !rr_inflight_[idx].exchange(true, std::memory_order_acq_rel); }
-    void end_resolution(std::size_t idx) { rr_inflight_[idx].store(false, std::memory_order_release); }
+    bool try_begin_resolution(std::size_t idx, uint64_t gen = 0) { return try_begin(rr_inflight_[idx], gen); }
+    void end_resolution(std::size_t idx, uint64_t gen = 0) { end(rr_inflight_[idx], gen); }
+    // A leg to a replaced backend stopped with a resolution want still pending: the client's next keep_alive drive
+    // fires the slot's current backend (take_ clears the mark).
+    void note_resolution_handoff(std::size_t idx) { rr_handoff_[idx].store(true, std::memory_order_release); }
+    bool take_resolution_handoff(std::size_t idx) {
+        return rr_handoff_[idx].load(std::memory_order_acquire) &&
+            rr_handoff_[idx].exchange(false, std::memory_order_acq_rel);
+    }
 
     // Observability / tests.
     int64_t folded() const { return folded_.load(std::memory_order_acquire); }
     // The set-wide journal reclaim floor: min commit_lsn across members (client_hdr.all_committed_lsn).
     int64_t all_committed() const { return all_committed_.load(std::memory_order_acquire); }
     bool caught_up(std::size_t idx) const {
-        if (synced_[idx].load(std::memory_order_acquire) < login_dlsn_) return false;
+        if (synced_[idx].load(std::memory_order_acquire) < floor_[idx].load(std::memory_order_acquire)) return false;
         std::shared_lock< std::shared_mutex > mg{map_mu_};
         return miss_[idx].empty();
     }
@@ -385,10 +452,32 @@ private:
     std::array< missing_map, k_max_members > miss_; // below the frontier: per-member Missing byte ranges
     std::array< std::atomic< int64_t >, k_max_members >
         synced_{}; // per member: client's model of its commit_lsn (>= L)
-    std::array< std::atomic< bool >, k_max_members >
+    std::array< std::atomic< int64_t >, k_max_members >
+        floor_{}; // per member: synced_ must reach this to serve reads (L; J after a mid-session replace)
+    std::array< std::atomic< uint64_t >, k_max_members >
+        gen_{}; // per member: generation of the backend in this slot; replies from older generations are ignored
+    // Per member: 0 = free, else (generation + 1) of the backend whose leg is outstanding.
+    std::array< std::atomic< uint64_t >, k_max_members >
         ka_inflight_{}; // per member: a keep_alive is outstanding (the one-per-leg collapse)
-    std::array< std::atomic< bool >, k_max_members >
+    std::array< std::atomic< uint64_t >, k_max_members >
         rr_inflight_{}; // per member: a request_resolution is outstanding (same collapse)
+    std::array< std::atomic< bool >, k_max_members >
+        rr_handoff_{}; // per member: a replaced backend's leg left a want for the current backend
+
+    // Take the gate for generation `gen`: free, or held by an OLDER generation (a replaced backend's leg).
+    static bool try_begin(std::atomic< uint64_t >& g, uint64_t gen) {
+        uint64_t const mine = gen + 1;
+        uint64_t cur = g.load(std::memory_order_acquire);
+        for (;;) {
+            if (cur >= mine) return false; // this generation (or a newer one) already has a leg out
+            if (g.compare_exchange_weak(cur, mine, std::memory_order_acq_rel, std::memory_order_acquire)) return true;
+        }
+    }
+    // Release only if the gate is still ours: a replaced backend's late completion leaves a newer leg's gate alone.
+    static void end(std::atomic< uint64_t >& g, uint64_t gen) {
+        uint64_t mine = gen + 1;
+        g.compare_exchange_strong(mine, 0, std::memory_order_release, std::memory_order_relaxed);
+    }
 
     std::mutex pending_mu_;                       // guards pending_
     std::vector< pending_miss > pending_;         // durable non-universal completed slots awaiting fold

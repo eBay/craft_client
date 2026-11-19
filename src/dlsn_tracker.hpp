@@ -173,6 +173,8 @@ public:
     }
 
     int64_t frontier() const { return frontier_.load(std::memory_order_acquire); }
+    // Highest dLSN handed out so far (-1 if none). seq_cst: see reserve().
+    int64_t issued() const { return next_dlsn_.load(std::memory_order_seq_cst) - 1; }
     int64_t read_horizon() const { return std::max(frontier(), highest_acked_.load(std::memory_order_acquire)); }
 
     // How to read [addr, addr+len) safely. Only the pathological branches suspend on the gate, and only a

@@ -4,6 +4,29 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## 0.6.0
+
+### Added
+- **Mid-session member replacement (a replica move).** `craft::replace_member(client, old_id, backend)` swaps one
+  member's backend while IO runs: no pause, no re-login. Every write whose dLSN is above the replace point J (the
+  highest dLSN reserved when the new backend is published) reaches the new backend; the new member serves reads
+  only once its own `commit_lsn` reaches J; replies, resolution credits and per-leg gates are generation-scoped so
+  the old backend's late traffic never counts for the new one. Errors: `no_such_device` (unknown `old_id`),
+  `invalid_argument` (null backend, or an id another member already holds). Not concurrent with login/logout.
+- `craft::member_ids(client)` and `craft::backend_id(backend)`: the members' peer ids, in slot order.
+- `craft::replace_tcp_member(cluster, old_id, endpoint)`: builds the TCP proxy for the new member (same volume,
+  op timeout and the endpoint's credential). Returns null and leaves the cluster unchanged for an unknown `old_id`
+  or an id another member holds. The replaced proxy stays owned by the cluster until the cluster is dropped.
+
+### Changed
+- `craft::backends(tcp_cluster_handle const&)` returns the backends **by value** (it was `const&`): the list can
+  change under `replace_tcp_member`. Source-compatible for callers that copy or iterate it; a caller that kept the
+  reference must keep the copy instead. `backends(local_cluster_handle const&)` is unchanged (`const&`): the
+  in-process cluster has no replace.
+- A read that finds no eligible member (or no quorum) now drives keep_alives, so a member that has caught up is
+  admitted by the next read without a write, flush or probe.
+- The resolution fold and read eligibility treat a write at or below a member's own `commit_lsn` as held by it.
+
 ## 0.5.0
 
 ### Added

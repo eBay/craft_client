@@ -42,11 +42,31 @@ using tcp_cluster_handle = std::shared_ptr< tcp_cluster >;
 // Connect to `members` (index 0 is the leader you first log in to; a NOT_LEADER redirect selects another). Each
 // endpoint is {peer id, "host:port"}. `vol_id` is what HELO presents to bind the session. `op_timeout` (0 =
 // block forever) bounds every reply: past it an op returns timed_out and the proxy resets + reconnects (re-HELO
-// on the next op). Nothing actually connects until the first op is issued on a proxy's worker.
+// on the next op). Nothing actually connects until the first op is issued on a proxy's worker. Throws
+// std::invalid_argument on a malformed "host:port" (no ":port", empty host, or a port that is not 1..65535).
 tcp_cluster_handle make_tcp_cluster(std::vector< replica_endpoint > const& members, volume_id_t vol_id,
                                     std::chrono::milliseconds op_timeout = std::chrono::milliseconds{0});
 
 // The backends to hand to make_client(); same order as `members`. Valid until the last handle is dropped.
-std::vector< std::shared_ptr< craft_replica > > const& backends(tcp_cluster_handle const& c);
+std::vector< std::shared_ptr< craft_replica > > backends(tcp_cluster_handle const& c);
+
+// A replica move: build the backend for `member` (same volume and op timeout as the cluster) in place of member
+// `old_id`, and return it for craft::replace_member(client, old_id, backend). The cluster keeps owning the old
+// proxy until the cluster itself is dropped, so IO still in flight to it can finish. Returns null, and leaves the
+// cluster unchanged, if `old_id` is not a member or `member.id` already belongs to ANOTHER member (the same id as
+// `old_id` is fine: a slot may keep its id across a move). Throws std::invalid_argument on a malformed "host:port"
+// (no ":port", empty host, or a port that is not 1..65535 in digits), like
+// make_tcp_cluster.
+//
+// Ordering with craft::replace_member: this re-points the cluster's slot first, and there is no rollback, so if
+// replace_member then rejects the backend the cluster and the client disagree on that slot. Validate the ids
+// against craft::member_ids(client) before calling this (ublkpp's craft_disk does).
+//
+// Resource note: each move keeps the replaced proxy -- the object and its per-ring connections to the old host --
+// until the cluster is dropped. A proxy's on-ring connections belong to their rings' owner threads, so closing
+// them early needs a per-ring hand-off and is a follow-up; until then the cost grows with the number of moves over
+// the device's lifetime (each one proxy and at most one connection per queue ring), and a re-attach clears it.
+std::shared_ptr< craft_replica > replace_tcp_member(tcp_cluster_handle const& c, peer_id_t const& old_id,
+                                                    replica_endpoint const& member);
 
 } // namespace craft
