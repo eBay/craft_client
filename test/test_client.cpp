@@ -271,8 +271,9 @@ TEST(CraftClient, N3_FailedWriteIsNotResolvedDuringTheSession) {
 
     EXPECT_EQ(cl.client->commit_lsn(), 0) << "the failed write pins the frontier for the rest of the session";
     EXPECT_EQ(rd(*cl.client, 4), v0) << "an overlapping read is served as of just before the failed write";
-    EXPECT_EQ(cl.set.replicas[1]->stats().journal_slots, 1u) << "no mid-session round copied the slot";
-    EXPECT_EQ(cl.set.replicas[2]->stats().journal_slots, 1u);
+    // Checked by position, not by slot count: a keep_alive may let a member reclaim dLSN 0 from its journal.
+    EXPECT_EQ(cl.set.replicas[1]->stats().last_append_lsn, 0) << "no mid-session round copied the slot";
+    EXPECT_EQ(cl.set.replicas[2]->stats().last_append_lsn, 0);
 }
 
 // The next login resolves it: a live member holds the slot, so it is filled everywhere -- the failed write
@@ -287,8 +288,10 @@ TEST(CraftClient, N3_NextLoginFillsAFailedWriteHeldByALiveMember) {
     auto fresh = relogin(cl, TOKEN + 1);
     EXPECT_EQ(fresh->commit_lsn(), 1) << "login resolved slot 1";
     EXPECT_EQ(rd(*fresh, 4), v1) << "the failed write completed late: it is the durable version now";
-    for (auto& r : cl.set.replicas)
-        EXPECT_EQ(r->stats().journal_slots, 2u) << "every live member holds the filled slot";
+    for (auto& r : cl.set.replicas) {
+        EXPECT_EQ(r->stats().journal_last_dlsn, 1) << "every live member holds the filled slot";
+        EXPECT_EQ(r->stats().empty_slots, 0u) << "filled, not Emptied";
+    }
 }
 
 // When no live member holds the failed write (its only copy is stuck in a 1 s-delayed transport), no replica's
@@ -319,8 +322,10 @@ TEST(CraftClient, N3_NextLoginDropsAFailedWriteNobodyHolds) {
         std::this_thread::sleep_for(std::chrono::milliseconds{10});
     ASSERT_EQ(cl.set.replicas[0]->stats().stale_term_writes, 1u) << "the late old-session write was delivered";
     EXPECT_EQ(rd(*fresh, 7), w) << "and rejected: the reused slot keeps the new session's data";
-    for (auto& r : cl.set.replicas)
-        EXPECT_EQ(r->stats().journal_slots, 1u);
+    for (auto& r : cl.set.replicas) {
+        EXPECT_EQ(r->stats().last_append_lsn, 0) << "only the reused dLSN 0, nothing from the old session";
+        EXPECT_EQ(r->stats().journal_last_dlsn, 0);
+    }
 }
 
 // The login's Empty verdict for a hole BELOW later writes: a failed write nobody holds sits between two acked ones.
