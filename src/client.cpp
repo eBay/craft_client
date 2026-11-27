@@ -70,6 +70,17 @@ std::optional< std::error_condition > craft_client::precheck(uint64_t addr, uint
     return std::nullopt;
 }
 
+// One timed keep_alive leg to member `idx` (craft::set_leg_observer). Every keep_alive goes through here: the
+// detached liveness drive, flush and login's admission probes.
+static async_result< lsn_pair > keep_alive_leg(::io_uring* q, std::shared_ptr< craft_replica > h, client_hdr hdr,
+                                               std::shared_ptr< read_route_map > route, std::size_t idx) {
+    auto const start =
+        route->timing_legs() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    auto r = co_await h->keep_alive(q, hdr);
+    route->observe_leg(idx, leg_op::keep_alive, start, r.has_value());
+    co_return r;
+}
+
 async_status craft_client::login(uint64_t client_token) {
     auto const ms = members(); // replace_member must not run concurrently with login (see client.hpp)
     auto const& replicas = ms->backends;
@@ -122,8 +133,8 @@ async_status craft_client::login(uint64_t client_token) {
             client_hdr const probe_hdr = make_hdr();
             std::vector< async_result< lsn_pair > > probes;
             probes.reserve(n);
-            for (auto& h : replicas)
-                probes.push_back(h->keep_alive(nullptr, probe_hdr));
+            for (std::size_t i = 0; i < n; ++i)
+                probes.push_back(keep_alive_leg(nullptr, replicas[i], probe_hdr, route_, i));
             auto const acks = co_await sisl::async::when_all(std::move(probes));
             std::size_t acked = 0;
             std::size_t refused = 0; // sticky: these members can never ack with this credential
@@ -466,10 +477,7 @@ async_result< size_t > craft_client::read(::io_uring* q, uint64_t addr, uint64_t
 // Fire-and-forget, so it captures the map by shared_ptr (it may outlive the client) and the backend by value.
 static async_status fire_keepalive(::io_uring* q, std::shared_ptr< craft_replica > h, client_hdr hdr,
                                    std::shared_ptr< read_route_map > route, std::size_t idx, uint64_t gen) {
-    auto const start =
-        route->timing_legs() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-    auto r = co_await h->keep_alive(q, hdr);
-    route->observe_leg(idx, leg_op::keep_alive, start, r.has_value());
+    auto r = co_await keep_alive_leg(q, std::move(h), hdr, route, idx);
     if (r.has_value()) route->advance_synced(idx, gen, r->commit_lsn);
     route->end_keepalive(idx, gen);
     co_return ok();
@@ -516,8 +524,8 @@ async_status craft_client::flush(::io_uring* q) {
     client_hdr const hdr = make_hdr();
     std::vector< async_result< lsn_pair > > futs;
     futs.reserve(n);
-    for (auto& h : ms->backends)
-        futs.push_back(h->keep_alive(q, hdr));
+    for (std::size_t i = 0; i < n; ++i)
+        futs.push_back(keep_alive_leg(q, ms->backends[i], hdr, route_, i));
 
     auto const results = co_await sisl::async::when_all(std::move(futs));
     bool any = false;

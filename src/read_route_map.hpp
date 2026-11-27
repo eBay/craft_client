@@ -121,11 +121,15 @@ public:
     // including stragglers that outlive the client. Set before the first IO, never changed during IO.
     void set_leg_observer(leg_observer obs) { leg_observer_ = std::move(obs); }
     bool timing_legs() const noexcept { return static_cast< bool >(leg_observer_); }
-    void observe_leg(std::size_t idx, leg_op op, std::chrono::steady_clock::time_point start, bool ok) const {
+    // noexcept: the observer is telemetry, so one that throws must not skip the leg's bookkeeping (a write's
+    // completion, a keep_alive's one-outstanding flag) that runs right after this.
+    void observe_leg(std::size_t idx, leg_op op, std::chrono::steady_clock::time_point start, bool ok) const noexcept {
         if (!leg_observer_) return;
         auto const us =
             std::chrono::duration_cast< std::chrono::microseconds >(std::chrono::steady_clock::now() - start);
-        leg_observer_(leg_sample{idx, op, static_cast< uint64_t >(us.count()), ok});
+        try {
+            leg_observer_(leg_sample{idx, op, static_cast< uint64_t >(us.count()), ok});
+        } catch (...) {}
     }
 
     // (Re-)seed for a session of `n` members with login dLSN `L` (the frontier; the overlay starts at L+1). The

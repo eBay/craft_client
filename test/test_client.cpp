@@ -33,6 +33,7 @@
 
 #include <boost/uuid/uuid_generators.hpp>
 #include <functional>
+#include <stdexcept>
 #include <gtest/gtest.h>
 #include <sisl/logging/logging.h>
 #include <sisl/options/options.h>
@@ -1350,10 +1351,13 @@ TEST(CraftClient, LegObserverReportsEveryMembersLegs) {
     ASSERT_TRUE(wr(*cl.client, 3, v));
     for (std::size_t m = 0; m < 3; ++m)
         EXPECT_TRUE(eventually([&] { return log.count(craft::leg_op::write, m, true) == 1; })) << "member " << m;
+    // flush BEFORE any read: a read also drives keep_alives, which would satisfy this check on its own.
+    log.clear();
+    ASSERT_TRUE(rg(cl.client->flush(nullptr)).has_value());
+    for (std::size_t m = 0; m < 3; ++m)
+        EXPECT_EQ(log.count(craft::leg_op::keep_alive, m, true), 1u) << "flush's keep_alive to member " << m;
     EXPECT_EQ(rd(*cl.client, 3), v);
     EXPECT_EQ(log.count(craft::leg_op::read, {}, true), 1u) << "one member served the read";
-    ASSERT_TRUE(rg(cl.client->flush(nullptr)).has_value());
-    EXPECT_TRUE(eventually([&] { return log.count(craft::leg_op::keep_alive, {}, true) >= 2; }));
 
     cl.set.replicas[2]->set_up(false);
     log.clear();
@@ -1368,6 +1372,28 @@ TEST(CraftClient, LegObserverReportsEveryMembersLegs) {
     ASSERT_TRUE(wr(*cl.client, 5, v));
     EXPECT_TRUE(eventually([&] { return log.count(craft::leg_op::write, {}, true) == 3; }))
         << "the observer carries over to the new session";
+}
+
+TEST(CraftClient, LoginProbesAreTimedLegs) {
+    auto cl = make_cluster(3);
+    leg_log log;
+    craft::set_leg_observer(cl.client, log.observer());
+    log.clear();
+    ASSERT_TRUE(rg(cl.client->login(TOKEN + 1)).has_value());
+    for (std::size_t m = 0; m < 3; ++m)
+        EXPECT_GE(log.count(craft::leg_op::keep_alive, m, true), 1u) << "login's admission probe to member " << m;
+}
+
+// A throwing observer is telemetry gone wrong, not an IO failure: writes still complete and commit advances.
+TEST(CraftClient, AThrowingLegObserverDoesNotStallIO) {
+    auto cl = make_cluster(3);
+    craft::set_leg_observer(cl.client, [](craft::leg_sample const&) { throw std::runtime_error("observer bug"); });
+    auto v = page_of(0x82);
+    for (uint64_t b = 0; b < 4; ++b)
+        ASSERT_TRUE(wr(*cl.client, b, v));
+    ASSERT_TRUE(rg(cl.client->flush(nullptr)).has_value());
+    EXPECT_EQ(cl.client->commit_lsn(), 3) << "every write's completion was recorded";
+    EXPECT_EQ(rd(*cl.client, 2), v);
 }
 
 TEST(CraftClient, NoLegObserverNoSamples) {
