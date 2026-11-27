@@ -4,6 +4,37 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## 0.8.0
+
+### Changed (breaking, peer plane only; craft_client's IO API is unchanged)
+- **Peer wire v2** (ops 17-20 redefined; `wire::k_peer_version` = 2; see docs/wire.md "Peer plane (wire v2)").
+  - Every peer request carries `peer_req_hdr`: version, partition id, the requester's RAFT term and session term.
+    A responder refuses another partition or version (`invalid_argument`).
+  - `get_rs_commit_lsn` replies with `poll_reply`: positions plus the responder's session term, fence term,
+    journal floor and `snapshot_receiving`.
+  - `fetch_data` takes inclusive dLSN **ranges** and a byte bound, and replies with at most one bounded reply's
+    worth: `fetch_result{slots, next, reclaimed_below, session_term}`. Continue from `next`, or use the new
+    `craft::peer::fetch_all`.
+  - `JournalSlot` gains `term` (the session term the slot was written at; on the wire per slot).
+  - New status `reclaimed` (11) / `craft_error::RECLAIMED`.
+- **One codec.** `craft::peer::encode_*` / `decode_*` now produce exactly the TCP payload (op header, then body) from
+  the `wire.hpp` layouts; the private duplicate layouts are gone. Decoding refuses a wrong version, bad ranges,
+  out-of-order descriptors and trailing bytes.
+
+### Fixed
+- **D7:** the reference replica's `fetch_data` handed out pointers into journal slots without holding them, so a
+  truncate or verdict could free the bytes while the server serialized the reply. Slots now hold their bytes via
+  `owned_data` (a reference, not a copy).
+- **D8:** `CraftTcpPeer` held no lock while threads shared it, never checked a reply's request id, waited forever for
+  a reply, and reported every error as INTERNAL. It now serializes round trips, matches request ids, bounds the
+  wait (`op_timeout`, default 10 s) and maps statuses through `status_to_error`.
+- **D9:** a fetch could not be bounded, so catching up a long gap failed every time once the reply exceeded `max_tx`.
+
+### Migration (HomeBlocks)
+- `craft_peer` signatures and `JournalSlot.term` changed; `encode_fetch_data_rsp` / `decode_fetch_data_rsp` now
+  take and return `fetch_result`. HomeBlocks' `test_craft_journal_slot_wire.cpp` needs updating when it moves to
+  0.8.
+
 ## 0.6.0
 
 ### Added

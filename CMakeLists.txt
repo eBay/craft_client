@@ -142,12 +142,13 @@ craft_test(test_tcp_replica  cluster_server)
 craft_test(test_async_mem    craft_reference) # the on-ring async transport (prepare_for_async) driven at depth
 craft_test(test_async_tcp    cluster_server) # the on-ring TCP transport (recv-demux pump) over real loopback sockets
 craft_test(test_auth_handshake raft_tcp_server) # client-side AUTH on both connect paths, against a scripted replica
+craft_test(test_peer_codec    craft_client) # the peer plane's wire v2 codec + the caller's fetch loop
 
 # Every suite EXCEPT test_wire / test_types / test_api reaches an internal header under src/ -- the reference
 # model, the TCP server/proxy, the craft_replica interface, the dlsn_tracker. That is the point of the split:
 # those types are NOT on the public surface, so only in-repo code may name them. test_api is deliberately left
 # out: it must compile against include/ alone, and it fails loudly if the public surface ever stops sufficing.
-foreach(t test_tcp_builder test_memory test_dlsn_tracker test_cluster test_tcp test_tcp_replica
+foreach(t test_peer_codec test_tcp_builder test_memory test_dlsn_tracker test_cluster test_tcp test_tcp_replica
           test_async_mem test_async_tcp test_auth_handshake)
   target_include_directories(${t} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
 endforeach()

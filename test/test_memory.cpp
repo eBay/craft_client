@@ -226,10 +226,11 @@ TEST(CraftMemModel, CommitPiggybacksOnWrite) {
     ASSERT_TRUE(rg(r.write(nullptr, chdr(term, /*commit_lsn*/ 0), 1, blk(6), blk(1), one_iov(b1)))
                     .has_value()); // rides commit 0
 
-    auto ls = rg(r.get_rs_commit_lsn(term, false /*is_login*/));
+    auto ls = rg(r.get_rs_commit_lsn(craft::peer_ctx{{}, 0, term}, false /*is_login*/));
     ASSERT_TRUE(ls.has_value());
-    EXPECT_EQ(ls->commit_lsn, 0); // dLSN 0 applied via the piggyback on the dLSN-1 write
-    EXPECT_EQ(ls->last_append_lsn, 1);
+    EXPECT_EQ(ls->lsns.commit_lsn, 0); // dLSN 0 applied via the piggyback on the dLSN-1 write
+    EXPECT_EQ(ls->lsns.last_append_lsn, 1);
+    EXPECT_EQ(ls->session_term, term);
     auto out = rd(r, term, 0, 5, 1); // served from the index (applied), not the overlay
     ASSERT_TRUE(out.ok);
     EXPECT_FALSE(out.layout[0].hole);
@@ -237,19 +238,54 @@ TEST(CraftMemModel, CommitPiggybacksOnWrite) {
 }
 
 // 9. commit piggybacks on a READ: reading with commit_lsn advances the frontier as a side-effect.
+// Peer fetch (wire v2) from the model: a bounded range reply that continues at `next`, each slot with its term, and
+// its bytes held by owned_data -- a reference to the journal's buffer, so a truncate or a verdict after the journal
+// lock is released cannot free them while a reply is being serialized (D7).
+TEST(CraftMemModel, PeerFetchIsBoundedAndHoldsTheBytes) {
+    auto g = make_mem_replica_group(new_vol(), 3, PAGE);
+    auto [term, dl] = login_ok(g);
+    auto& r = *g.replicas[0];
+    for (int d = 0; d < 6; ++d) {
+        std::vector< uint8_t > b(PAGE, static_cast< uint8_t >(0x10 + d));
+        ASSERT_TRUE(rg(r.write(nullptr, chdr(term), d, blk(d), blk(1), one_iov(b))).has_value());
+    }
+    auto f = rg(r.fetch_data(craft::peer_ctx{{}, 0, term}, {{0, 1}, {3, 5}}, 2 * PAGE));
+    ASSERT_TRUE(f.has_value());
+    ASSERT_EQ(f->slots.size(), 2u) << "two pages of data fit the budget";
+    EXPECT_EQ(f->slots[0].lsn, 0);
+    EXPECT_EQ(f->slots[1].lsn, 1);
+    EXPECT_EQ(f->next, 3) << "continues at the next requested dLSN";
+    EXPECT_EQ(f->session_term, term);
+    EXPECT_EQ(f->slots[0].term, term);
+    ASSERT_TRUE(f->slots[0].owned_data);
+    EXPECT_EQ(f->slots[0].data.iovs[0].iov_base, f->slots[0].owned_data->data())
+        << "the iovec points at the owned bytes";
+    EXPECT_GE(f->slots[0].owned_data.use_count(), 2) << "shared with the journal, not copied";
+
+    auto rest = rg(r.fetch_data(craft::peer_ctx{{}, 0, term}, {{3, 5}}, 2 * PAGE));
+    ASSERT_TRUE(rest.has_value());
+    ASSERT_EQ(rest->slots.size(), 2u);
+    EXPECT_EQ(rest->next, 5);
+    auto one = rg(r.fetch_data(craft::peer_ctx{{}, 0, term}, {{5, 5}}, 1));
+    ASSERT_TRUE(one.has_value());
+    EXPECT_EQ(one->slots.size(), 1u) << "always at least one slot, even past the budget";
+    EXPECT_EQ(one->next, -1);
+}
+
 TEST(CraftMemModel, CommitPiggybacksOnRead) {
     auto g = make_mem_replica_group(new_vol(), 3, PAGE);
     auto [term, dl] = login_ok(g);
     auto& r = *g.replicas[0];
     auto buf = page_of(0x33);
     ASSERT_TRUE(rg(r.write(nullptr, chdr(term), 0, blk(5), blk(1), one_iov(buf))).has_value());
-    ASSERT_EQ(rg(r.get_rs_commit_lsn(term, false /*is_login*/))->commit_lsn, -1); // not committed yet
+    ASSERT_EQ(rg(r.get_rs_commit_lsn(craft::peer_ctx{{}, 0, term}, false /*is_login*/))->lsns.commit_lsn,
+              -1); // not committed yet
 
     auto out = rd(r, term, /*H*/ 0, 5, 1, /*commit_lsn*/ 0); // read advances the frontier to 0
     ASSERT_TRUE(out.ok);
     EXPECT_FALSE(out.layout[0].hole);
     EXPECT_EQ(out.data, buf);
-    EXPECT_EQ(rg(r.get_rs_commit_lsn(term, false /*is_login*/))->commit_lsn, 0);
+    EXPECT_EQ(rg(r.get_rs_commit_lsn(craft::peer_ctx{{}, 0, term}, false /*is_login*/))->lsns.commit_lsn, 0);
 }
 
 // 10. term fencing on write: an IO whose term != the session term is rejected (the protocol's ETERM).

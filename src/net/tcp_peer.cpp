@@ -2,14 +2,14 @@
 
 #include <cstring>
 
+#include <craft/status.hpp> // status_to_error
+
 namespace craft::net {
 
 namespace {
-auto fail(craft_error e) { return std::unexpected(make_error_condition(e)); }
+auto fail(std::error_condition e) { return std::unexpected(e); }
 
 std::error_condition net_to_error(net_error e) {
-    // Same mapping as tcp_replica.cpp's net_to_error -- kept local for now since this file has no other
-    // reason to depend on tcp_replica.cpp. Worth factoring into a shared helper once both exist stably.
     switch (e) {
     case net_error::send:
     case net_error::setup:
@@ -27,124 +27,85 @@ std::error_condition net_to_error(net_error e) {
 }
 } // namespace
 
-CraftTcpPeer::CraftTcpPeer(std::string host, uint16_t port, peer_id_t id, std::chrono::milliseconds op_timeout) :
-        host_{std::move(host)}, port_{port}, id_{id}, op_timeout_{op_timeout} {}
+CraftTcpPeer::CraftTcpPeer(std::string host, uint16_t port, peer_id_t id, std::chrono::milliseconds op_timeout,
+                           uint32_t max_tx) :
+        host_{std::move(host)},
+        port_{port},
+        id_{id},
+        op_timeout_{op_timeout > std::chrono::milliseconds{0} ? op_timeout : k_default_op_timeout},
+        max_tx_{max_tx} {}
 
 CraftTcpPeer::~CraftTcpPeer() = default;
 
 bool CraftTcpPeer::ensure_connected() {
     if (connected_) return true;
-    auto c =
-        craft_conn::connect(host_, port_, op_timeout_ > std::chrono::milliseconds{0} ? op_timeout_ : k_connect_timeout);
+    auto c = craft_conn::connect(host_, port_, op_timeout_);
     if (!c) return false;
     conn_ = std::move(*c);
     connected_ = true;
     return true;
 }
 
-async_result< lsn_pair > CraftTcpPeer::get_rs_commit_lsn(uint64_t term, bool is_login) {
-    if (!ensure_connected()) co_return fail(craft_error::REPLICA_DOWN);
-
-    wire::get_rs_commit_lsn_req req{};
-    req.term = term;
-    req.is_login = is_login ? 1 : 0;
-
+result< std::vector< uint8_t > > CraftTcpPeer::round_trip(wire::op op, std::size_t op_hdr_size,
+                                                          std::span< uint8_t const > payload, uint32_t reply_bound) {
+    std::lock_guard g{mu_};
+    if (!ensure_connected()) return fail(make_error_condition(craft_error::REPLICA_DOWN));
+    uint16_t const rid = next_rid_++;
+    if (next_rid_ == 0) next_rid_ = 1;
     std::vector< uint8_t > out;
-    wire::frame_message(out, wire::op::get_rs_commit_lsn, 0, next_request_id(),
-                        {reinterpret_cast< uint8_t const* >(&req), sizeof(req)}, {});
+    wire::frame_message(out, op, 0, rid, payload.first(op_hdr_size), payload.subspan(op_hdr_size));
     if (!conn_.send_all(out)) {
         connected_ = false;
-        co_return fail(craft_error::REPLICA_DOWN);
+        return fail(make_error_condition(craft_error::REPLICA_DOWN)); // never delivered
     }
-
-    auto msg = conn_.recv_message(wire::k_default_max_tx);
+    auto msg = conn_.recv_message(reply_bound, op_timeout_);
     if (!msg) {
+        connected_ = false; // a late reply would otherwise answer the next request
+        return fail(net_to_error(msg.error()));
+    }
+    auto const parsed = wire::parse_message(*msg, reply_bound);
+    if (!parsed || parsed->hdr.request_id != rid || parsed->hdr.op != static_cast< uint8_t >(op) + 1) {
         connected_ = false;
-        co_return std::unexpected(net_to_error(msg.error()));
+        return fail(std::make_error_condition(std::errc::protocol_error));
     }
-    auto parsed = wire::parse_message(*msg, wire::k_default_max_tx);
-    if (!parsed) {
-        connected_ = false;
-        co_return fail(craft_error::INTERNAL); // malformed reply
-    }
-    auto const rsp = wire::decode< wire::get_rs_commit_lsn_rsp >(parsed->op_header);
-    if (static_cast< wire::status >(parsed->hdr.status) != wire::status::ok) {
-        co_return fail(craft_error::INTERNAL); // TODO: proper status_to_error mapping, mirrors tcp_replica.cpp
-    }
-    co_return lsn_pair{rsp.commit_lsn, rsp.last_append_lsn};
+    if (auto const st = static_cast< wire::status >(parsed->hdr.status); st != wire::status::ok)
+        return fail(status_to_error(st));
+    return std::move(*msg);
 }
 
-async_result< std::vector< JournalSlot > > CraftTcpPeer::fetch_data(std::vector< int64_t > lsns) {
-    if (!ensure_connected()) co_return fail(craft_error::REPLICA_DOWN);
+async_result< poll_reply > CraftTcpPeer::get_rs_commit_lsn(peer_ctx const& ctx, bool is_login) {
+    auto const req = peer::encode_get_rs_commit_lsn_req(ctx, is_login);
+    auto msg = round_trip(wire::op::get_rs_commit_lsn, sizeof(wire::get_rs_commit_lsn_req), req, max_tx_);
+    if (!msg) co_return fail(msg.error());
+    auto r = peer::decode_get_rs_commit_lsn_rsp(std::span< uint8_t const >{*msg}.subspan(sizeof(wire::msg_hdr)));
+    if (!r) co_return fail(std::make_error_condition(std::errc::protocol_error));
+    co_return *r;
+}
 
-    wire::fetch_data_req req{};
-    req.lsn_count = static_cast< uint32_t >(lsns.size());
-    std::vector< uint8_t > body;
-    for (auto lsn : lsns)
-        wire::put(body, lsn);
-
-    std::vector< uint8_t > out;
-    wire::frame_message(out, wire::op::fetch_data, 0, next_request_id(),
-                        {reinterpret_cast< uint8_t const* >(&req), sizeof(req)}, body);
-    if (!conn_.send_all(out)) {
-        connected_ = false;
-        co_return fail(craft_error::REPLICA_DOWN);
-    }
-
-    auto msg = conn_.recv_message(wire::k_default_max_tx);
-    if (!msg) {
-        connected_ = false;
-        co_return std::unexpected(net_to_error(msg.error()));
-    }
-    auto parsed = wire::parse_message(*msg, wire::k_default_max_tx);
-    if (!parsed) {
-        connected_ = false;
-        co_return fail(craft_error::INTERNAL);
-    }
-    if (static_cast< wire::status >(parsed->hdr.status) != wire::status::ok) { co_return fail(craft_error::INTERNAL); }
-
-    auto const rsp = wire::decode< wire::fetch_data_rsp >(parsed->op_header);
-    std::size_t const desc_bytes = static_cast< std::size_t >(rsp.slot_count) * sizeof(wire::fetch_slot_desc);
-    if (parsed->body.size() < desc_bytes) co_return fail(craft_error::INTERNAL);
-
-    std::vector< JournalSlot > out_slots;
-    out_slots.reserve(rsp.slot_count);
-    std::size_t data_off = desc_bytes;
-
-    // --- Parsing assumptions ---
-    // Layout: the response body is N fixed-size `fetch_slot_desc` headers laid out contiguously
-    //    starting at offset 0 (server writes all descriptors first, then all slot data after —
-    //    see fetch_data handler), so descriptor i lives at byte offset i * sizeof(fetch_slot_desc).
-    //    This is NOT self-describing in the response; it's an assumed layout convention shared by
-    //    both peers. If the wire format ever interleaves descriptors and data, this indexing breaks
-    //    silently with no compiler or protocol-level signal.
-    for (std::size_t i = 0; i < rsp.slot_count; ++i) {
-        std::size_t const desc_off = i * sizeof(wire::fetch_slot_desc);
-        if (desc_off + sizeof(wire::fetch_slot_desc) > parsed->body.size()) { co_return fail(craft_error::INTERNAL); }
-        auto const sd = wire::decode< wire::fetch_slot_desc >(parsed->body.subspan(i * sizeof(wire::fetch_slot_desc)));
-
-        JournalSlot js;
-        js.lsn = sd.lsn;
-        js.lba = sd.lba;
-        js.len = sd.len;
-        js.is_empty = sd.is_empty != 0;
-        js.all_zeros = sd.all_zeros != 0;
-
-        if (!js.is_empty && !js.all_zeros) {
-            std::size_t const nbytes = static_cast< std::size_t >(sd.byte_len);
-            if (data_off + nbytes > parsed->body.size()) co_return fail(craft_error::INTERNAL);
-
-            js.owned_data = std::make_shared< std::vector< uint8_t > >(parsed->body.begin() + data_off,
-                                                                       parsed->body.begin() + data_off + nbytes);
-            js.data.size = nbytes;
-            js.data.iovs.push_back(iovec{js.owned_data->data(), nbytes});
-
-            data_off += nbytes;
+async_result< fetch_result > CraftTcpPeer::fetch_data(peer_ctx const& ctx, std::vector< lsn_range > ranges,
+                                                      uint64_t max_bytes) {
+    // Never ask for more than this connection can parse.
+    uint64_t const want = (max_bytes == 0 || max_bytes > max_tx_) ? max_tx_ : max_bytes;
+    auto const req = peer::encode_fetch_data_req(ctx, ranges, want);
+    auto msg =
+        round_trip(wire::op::fetch_data, sizeof(wire::fetch_data_req), req, wire::fetch_reply_parse_bound(max_tx_));
+    if (!msg) co_return fail(msg.error());
+    auto const payload = std::span< uint8_t const >{*msg}.subspan(sizeof(wire::msg_hdr));
+    auto r = peer::decode_fetch_data_rsp(
+        sisl::io_blob{const_cast< uint8_t* >(payload.data()), static_cast< uint32_t >(payload.size()), false});
+    if (!r) co_return fail(std::make_error_condition(std::errc::protocol_error));
+    // The slots borrow from `msg`, which dies with this frame: give each its own bytes.
+    for (auto& s : r->slots) {
+        if (s.data.size == 0) continue;
+        s.owned_data = std::make_shared< std::vector< uint8_t > >();
+        s.owned_data->reserve(s.data.size);
+        for (auto const& iov : s.data.iovs) {
+            auto const* p = static_cast< uint8_t const* >(iov.iov_base);
+            s.owned_data->insert(s.owned_data->end(), p, p + iov.iov_len);
         }
-        out_slots.push_back(std::move(js));
+        s.data.iovs = {iovec{s.owned_data->data(), s.owned_data->size()}};
     }
-
-    co_return out_slots;
+    co_return std::move(*r);
 }
 
 } // namespace craft::net

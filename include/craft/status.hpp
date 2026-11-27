@@ -40,6 +40,7 @@ inline wire::status to_wire_status(std::error_condition const& e) {
     if (e == craft_error::NOT_EXPOSED) return wire::status::not_exposed;
     if (e == craft_error::STALE_CREDENTIAL) return wire::status::stale_credential;
     if (e == craft_error::AUTH_FAILED) return wire::status::auth_failed;
+    if (e == craft_error::RECLAIMED) return wire::status::reclaimed;
     return wire::status::internal;
 }
 
@@ -60,6 +61,8 @@ inline std::error_condition status_to_error(wire::status s) {
         return make_error_condition(craft_error::REPLICA_DOWN);
     case wire::status::invalid_argument:
         return std::make_error_condition(std::errc::invalid_argument);
+    case wire::status::reclaimed:
+        return make_error_condition(craft_error::RECLAIMED);
     case wire::status::not_exposed:
     case wire::status::stale_credential:
     case wire::status::auth_failed:

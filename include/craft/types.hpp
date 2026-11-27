@@ -158,7 +158,8 @@ ENUM(craft_error, uint16_t,
      NOT_IMPLEMENTED,
      NOT_EXPOSED,      // AUTH: the replica holds no credential for the volume
      STALE_CREDENTIAL, // AUTH: the credential was rotated; get fresh attach info
-     AUTH_FAILED)      // AUTH: refused, a proof did not verify (either direction), or the local credential is unusable
+     AUTH_FAILED,      // AUTH: refused, a proof did not verify (either direction), or the local credential is unusable
+     RECLAIMED)        // peer plane: the responder reclaimed the requested slots from its journal (not "never held")
 
 class craft_error_category : public std::error_category {
 public:

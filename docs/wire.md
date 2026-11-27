@@ -81,9 +81,8 @@ the value alone is a direction check. The op set is far under 64, so a single by
 | `AUTH_START` | 21 | | `AUTH_CHALLENGE` | 22 |
 | `AUTH_PROOF` | 23 | | `AUTH_RESULT` | 24 |
 
-1-14 are the client plane. 15-20 are the peer plane (replica to replica, plus bootstrap volume creation),
-specified by `wire.hpp` and not described further here. 21-24 are the connection-phase AUTH exchange (see
-*Authentication*).
+1-14 are the client plane. 15-16 create a volume (bootstrap). 17-20 are the peer plane, replica to replica (see
+*Peer plane (wire v2)*). 21-24 are the connection-phase AUTH exchange (see *Authentication*).
 
 `request_id` correlates a response to its request. It is a per-connection correlator allocated per request --
 not the ublk tag (a split read issues several requests against one tag) -- and is not reused on a connection
@@ -487,11 +486,53 @@ receiver MUST reject a `body_len` over the bound it applies -- a server bounds a
 carry no extents), a client bounds a reply at `framed_body_max` -- to cap its buffer. There is no
 application-level fragmentation or reassembly.
 
+## Peer plane (wire v2)
+
+Replica to replica: the leader polls the members, and a member that is behind fetches journal slots from one
+that holds them. A craft_client never sends these. The layouts are `wire.hpp`'s; the codec in `include/craft/peer.hpp`
+encodes the same payload (op header, then body) for any transport, so a BM may carry it over its own RPC channel
+instead of this TCP framing. Ops 17-20 were redefined in place for v2 (the v1 layouts were never deployed).
+
+Every request leads with `peer_req_hdr` (40 bytes):
+
+| Field | Meaning |
+|---|---|
+| `peer_version` | `k_peer_version` (2). Any other value: `invalid_argument`. |
+| `partition_id` | The partition asked about. A responder that does not serve it: `invalid_argument`. |
+| `leader_raft_term` | The requester's RAFT term. A responder refuses a stale one (`stale_term`), so a deposed leader's poll is never taken as evidence. |
+| `session_term` | The requester's CRAFT session term. A login poll carries the login's new term. |
+
+A responder does **not** refuse an older session term: the member that is behind is exactly the one with the older
+session. Every reply carries the responder's session term instead, and the requester judges it: data from a
+responder whose session term is older may be an old session's, for any slot above that session's truncation point.
+
+**GET_RS_COMMIT_LSN** (17/18). Request: `peer_req_hdr`, `is_login`. With `is_login` the responder fences at
+`session_term` (refuses the old session's writes from then on). Reply (48 bytes): `commit_lsn`, `last_append_lsn`,
+`session_term`, `fence_term` (equal to `session_term` unless a login fenced it), `journal_floor` (the journal holds
+nothing at or below it; -1: nothing reclaimed), `snapshot_receiving`.
+
+**FETCH_DATA** (19/20). Request: `peer_req_hdr`, `range_count`, `max_bytes`; body: `range_count` inclusive
+`[lo, hi]` dLSN pairs, ascending and non-overlapping, at most `k_fetch_max_ranges` (4096). Reply header (32 bytes):
+`session_term`, `next`, `reclaimed_below`, `slot_count`; body: `slot_count` descriptors (48 bytes: `lsn`, `term`,
+`lba`, `len`, `byte_len`, `is_empty`, `all_zeros`) in ascending dLSN order, then each data slot's bytes in the same
+order. A held slot comes back as data, a zero write (`all_zeros`) or an Empty verdict (`is_empty`); a slot not held
+is omitted.
+
+- **Bounded replies.** A reply carries at most `min(max_bytes, max_tx)` of slot data (0 asks for `max_tx`) and at
+  most `k_fetch_max_slots` (1024) descriptors, but always at least one slot. `next` is the first requested dLSN it
+  did not cover (-1: everything); the requester asks again for the ranges from `next` on (`peer::fetch_all` does).
+  A requester parses a reply with `fetch_reply_parse_bound(max_tx)` (`max_tx` plus the descriptors).
+- **Reclaimed is not absent.** `reclaimed_below` says the responder reclaimed every slot at or below it, so a slot
+  missing below it was not "never held" and is no evidence for an Empty verdict. `reclaimed` (status 11) answers a
+  request whose every range is below the floor.
+- **Per-slot term.** Each descriptor carries the session term the slot was written at, so a requester can reject a
+  slot a later login dropped.
+
+Peer connections are not authenticated yet; a replica serving them on its CRAFT port must not apply the AUTH
+ordering rule to them until they have a credential model.
+
 ## Not covered yet
 
-- **Peer-plane op layouts** (15-20): allocated and defined in `wire.hpp`, not yet described here. Peer-plane
-  connections are not authenticated yet; a replica serving them on its CRAFT port must not apply the AUTH
-  ordering rule to them until they have a credential model.
 - **Encryption**: out of scope for an intra-DC v1. If needed it is TLS under the TCP framing, below and
   independent of the AUTH exchange.
 - **Multi-partition**: each partition is its own client with its own session and connections; this document

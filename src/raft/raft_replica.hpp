@@ -65,14 +65,20 @@ public:
     result< void > srv_create_partition(std::array< uint8_t, 16 > const& partition_id,
                                         std::vector< replica_endpoint > const& members);
 
-    result< lsn_pair > srv_get_rs_commit_lsn(uint64_t term, bool is_login) {
-        return do_get_rs_commit_lsn(term, is_login);
-    }
-    result< std::vector< JournalSlot > > srv_fetch_data(std::vector< int64_t > const& lsns);
+    // Peer plane (wire v2). Both refuse a partition this replica does not serve (invalid_argument). The reference model
+    // has no RAFT term, so leader_raft_term is accepted as is; a real BM refuses a stale one.
+    result< poll_reply > srv_get_rs_commit_lsn(peer_ctx const& ctx, bool is_login);
+    // `data_budget`: the reply's slot-data bound (the server passes min(max_bytes, its max_tx)).
+    result< fetch_result > srv_fetch_data(peer_ctx const& ctx, std::vector< lsn_range > const& ranges,
+                                          uint64_t data_budget);
+    bool srv_has_partition(volume_id_t const& partition_id) const;
     session_info srv_session_info(std::array< uint8_t, 16 > const& partition_id) const;
 
 private:
-    result< lsn_pair > do_get_rs_commit_lsn(uint64_t term, bool is_login);
+    poll_reply do_get_rs_commit_lsn(uint64_t term, bool is_login);
+    // Fetch every slot in `lsns` from `peer`, one bounded reply at a time; each slot owns its bytes.
+    result< std::vector< JournalSlot > > fetch_from(craft_peer& peer, boost::uuids::uuid const& partition_uuid,
+                                                    uint64_t term, std::vector< int64_t > const& lsns);
     void apply_sync(boost::uuids::uuid const& vol_uuid, SyncRSCommitLSNMsg m);
     result< LoginResult > apply_login(std::array< uint8_t, 16 > const& partition_id, uint64_t client_token,
                                       uint64_t term);

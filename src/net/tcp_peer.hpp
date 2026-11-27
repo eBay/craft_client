@@ -2,6 +2,8 @@
 
 #include <chrono>
 #include <cstdint>
+#include <mutex>
+#include <span>
 #include <string>
 #include <vector>
 
@@ -12,33 +14,41 @@
 
 namespace craft::net {
 
+// The reference TCP binding of the peer plane (wire v2): one blocking connection to one member, shared by every user
+// of the registry entry, so each round trip holds the connection's mutex. A reply must echo the request's id; a
+// reply that does not, or a transport error, drops the connection (the next call reconnects).
 class CraftTcpPeer final : public craft_peer {
 public:
+    static constexpr std::chrono::milliseconds k_default_op_timeout{10000};
+
+    // `op_timeout` bounds connect and every reply wait (0: k_default_op_timeout). `max_tx` is the member volume's
+    // max transfer: it caps a fetch reply's data and sizes the parse bound.
     CraftTcpPeer(std::string host, uint16_t port, peer_id_t id,
-                 std::chrono::milliseconds op_timeout = std::chrono::milliseconds{0});
+                 std::chrono::milliseconds op_timeout = std::chrono::milliseconds{0},
+                 uint32_t max_tx = wire::k_default_max_tx);
     ~CraftTcpPeer() override;
 
     CraftTcpPeer(CraftTcpPeer const&) = delete;
     CraftTcpPeer& operator=(CraftTcpPeer const&) = delete;
 
-    // ── craft_peer: existing (unchanged) ──
-    virtual async_result< lsn_pair > get_rs_commit_lsn(uint64_t term, bool is_login) override;
-    async_result< std::vector< JournalSlot > > fetch_data(std::vector< int64_t > lsns) override;
-
-    // ── NEW, not yet on craft_peer.hpp: Login's Phase 1 poll specifically -- carries the caller's own
-    // watermarks + the quiesce flag. Add to craft_peer.hpp as a pure virtual once this compiles standalone,
-    // at which point MemCraftReplica also needs a stub implementation.
-    async_result< lsn_pair > login_poll(uint64_t term, bool is_login, int64_t my_commit, int64_t my_append);
+    async_result< poll_reply > get_rs_commit_lsn(peer_ctx const& ctx, bool is_login) override;
+    // Each returned slot owns its bytes (owned_data).
+    async_result< fetch_result > fetch_data(peer_ctx const& ctx, std::vector< lsn_range > ranges,
+                                            uint64_t max_bytes) override;
 
 private:
+    // One framed request/response under mu_: the reply message (msg_hdr included) or the error to return.
+    result< std::vector< uint8_t > > round_trip(wire::op op, std::size_t op_hdr_size,
+                                                std::span< uint8_t const > payload, uint32_t reply_bound);
     bool ensure_connected();
-    uint16_t next_request_id() { return next_rid_++; }
 
     std::string host_;
     uint16_t port_;
     peer_id_t id_;
-    std::chrono::milliseconds op_timeout_{0};
+    std::chrono::milliseconds op_timeout_;
+    uint32_t max_tx_;
 
+    std::mutex mu_; // one round trip at a time on the connection
     craft_conn conn_;
     bool connected_{false};
     uint16_t next_rid_{1};
