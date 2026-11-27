@@ -4,6 +4,14 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## 0.7.0
+
+### Added
+- **Per-member latency.** `craft::set_leg_observer(client, obs)` reports every leg, meaning one member's write,
+  read or keep_alive, as `leg_sample{member, op, usec, ok}`, timed from issue to reply. A write acks at quorum, but
+  its slower legs are still reported, which is what shows a slow member. Set it once before the first IO. It carries
+  over re-logins, and with no observer set legs are not timed at all.
+
 ## 0.6.0
 
 ### Added

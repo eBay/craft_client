@@ -73,6 +73,10 @@ public:
     uint64_t winner_scans() const { return tracker_->winner_scans(); }
     int64_t route_folded() const { return route_->folded(); }
     bool route_caught_up(std::size_t idx) const { return route_->caught_up(idx); }
+    void set_leg_observer(leg_observer obs) {
+        leg_observer_ = std::move(obs);
+        route_->set_leg_observer(leg_observer_); // and every map a later login installs (see login)
+    }
     int64_t all_committed_lsn() const { return route_->all_committed(); }
     tracker_stats dlsn_stats(std::size_t sample_limit = 16) const { return tracker_->stats(sample_limit); }
     std::size_t replica_count() const { return n_; }
@@ -133,6 +137,7 @@ private:
     uint32_t lba_size_{0};
     uint64_t capacity_{0};
     uint32_t max_tx_{0};
+    leg_observer leg_observer_; // copied into each session's route map
 
     // shared_ptr like route_: the detached resolution-round runner retires slots into the tracker and may
     // outlive the client, so it holds this map's/tracker's lifetime rather than referencing `this`.

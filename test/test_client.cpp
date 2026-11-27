@@ -32,6 +32,8 @@
 #include <vector>
 
 #include <boost/uuid/uuid_generators.hpp>
+#include <functional>
+#include <stdexcept>
 #include <gtest/gtest.h>
 #include <sisl/logging/logging.h>
 #include <sisl/options/options.h>
@@ -1306,6 +1308,104 @@ TEST(CraftClient, AWantPendingAcrossASwapReachesTheNewBackend) {
     EXPECT_EQ(fresh->resolution_token.load(), TOKEN) << "with the session's client_token, which its HELO presents";
     ASSERT_TRUE(rg(cl.client->flush(nullptr)).has_value());
     EXPECT_EQ(cl.client->commit_lsn(), 2) << "the frontier is no longer pinned";
+}
+
+// Per-member latency: every leg -- each member's write, the read's member, each keep_alive -- is reported with its
+// member slot and outcome; a down member's legs report ok=false. The observer survives a re-login.
+namespace {
+struct leg_log {
+    std::mutex mu;
+    std::vector< craft::leg_sample > v;
+    craft::leg_observer observer() {
+        return [this](craft::leg_sample const& s) {
+            std::lock_guard g{mu};
+            v.push_back(s);
+        };
+    }
+    std::size_t count(craft::leg_op op, std::optional< std::size_t > member = {}, std::optional< bool > ok = {}) {
+        std::lock_guard g{mu};
+        return std::count_if(v.begin(), v.end(), [&](auto const& s) {
+            return s.op == op && (!member || s.member == *member) && (!ok || s.ok == *ok);
+        });
+    }
+    void clear() {
+        std::lock_guard g{mu};
+        v.clear();
+    }
+};
+bool eventually(std::function< bool() > f) {
+    for (int i = 0; i < 500; ++i) {
+        if (f()) return true;
+        std::this_thread::sleep_for(std::chrono::milliseconds{2});
+    }
+    return f();
+}
+} // namespace
+
+TEST(CraftClient, LegObserverReportsEveryMembersLegs) {
+    auto cl = make_cluster(3);
+    leg_log log;
+    craft::set_leg_observer(cl.client, log.observer());
+
+    auto v = page_of(0x80);
+    ASSERT_TRUE(wr(*cl.client, 3, v));
+    for (std::size_t m = 0; m < 3; ++m)
+        EXPECT_TRUE(eventually([&] { return log.count(craft::leg_op::write, m, true) == 1; })) << "member " << m;
+    // flush BEFORE any read: a read also drives keep_alives, which would satisfy this check on its own.
+    log.clear();
+    ASSERT_TRUE(rg(cl.client->flush(nullptr)).has_value());
+    for (std::size_t m = 0; m < 3; ++m)
+        EXPECT_EQ(log.count(craft::leg_op::keep_alive, m, true), 1u) << "flush's keep_alive to member " << m;
+    EXPECT_EQ(rd(*cl.client, 3), v);
+    EXPECT_EQ(log.count(craft::leg_op::read, {}, true), 1u) << "one member served the read";
+
+    cl.set.replicas[2]->set_up(false);
+    log.clear();
+    ASSERT_TRUE(wr(*cl.client, 4, v)) << "quorum without member 2";
+    EXPECT_TRUE(eventually([&] { return log.count(craft::leg_op::write, 2, false) == 1; }))
+        << "the down member's leg fails";
+    EXPECT_EQ(log.count(craft::leg_op::write, 0, true), 1u);
+    cl.set.replicas[2]->set_up(true);
+
+    ASSERT_TRUE(rg(cl.client->login(TOKEN + 1)).has_value()) << "re-login installs a fresh route map";
+    log.clear();
+    ASSERT_TRUE(wr(*cl.client, 5, v));
+    EXPECT_TRUE(eventually([&] { return log.count(craft::leg_op::write, {}, true) == 3; }))
+        << "the observer carries over to the new session";
+}
+
+TEST(CraftClient, LoginProbesAreTimedLegs) {
+    auto cl = make_cluster(3);
+    leg_log log;
+    craft::set_leg_observer(cl.client, log.observer());
+    log.clear();
+    ASSERT_TRUE(rg(cl.client->login(TOKEN + 1)).has_value());
+    for (std::size_t m = 0; m < 3; ++m)
+        EXPECT_GE(log.count(craft::leg_op::keep_alive, m, true), 1u) << "login's admission probe to member " << m;
+}
+
+// A throwing observer is telemetry gone wrong, not an IO failure: writes still complete and commit advances.
+TEST(CraftClient, AThrowingLegObserverDoesNotStallIO) {
+    auto cl = make_cluster(3);
+    craft::set_leg_observer(cl.client, [](craft::leg_sample const&) { throw std::runtime_error("observer bug"); });
+    auto v = page_of(0x82);
+    for (uint64_t b = 0; b < 4; ++b)
+        ASSERT_TRUE(wr(*cl.client, b, v));
+    ASSERT_TRUE(rg(cl.client->flush(nullptr)).has_value());
+    EXPECT_EQ(cl.client->commit_lsn(), 3) << "every write's completion was recorded";
+    EXPECT_EQ(rd(*cl.client, 2), v);
+}
+
+TEST(CraftClient, NoLegObserverNoSamples) {
+    auto cl = make_cluster(3);
+    leg_log log;
+    craft::set_leg_observer(cl.client, log.observer());
+    craft::set_leg_observer(cl.client, nullptr); // cleared before IO: legs are not timed
+    auto v = page_of(0x81);
+    ASSERT_TRUE(wr(*cl.client, 3, v));
+    EXPECT_EQ(rd(*cl.client, 3), v);
+    EXPECT_EQ(log.count(craft::leg_op::write), 0u);
+    EXPECT_EQ(log.count(craft::leg_op::read), 0u);
 }
 
 TEST(CraftClient, ReplaceMemberRejectsBadArguments) {
