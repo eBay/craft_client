@@ -323,6 +323,40 @@ TEST(CraftClient, N3_NextLoginDropsAFailedWriteNobodyHolds) {
         EXPECT_EQ(r->stats().journal_slots, 1u);
 }
 
+// The login's Empty verdict for a hole BELOW later writes: a failed write nobody holds sits between two acked ones.
+// The login declares it Empty on every member, its commit advances past it to the newest write, the later write
+// keeps its data, and the hole's LBA reads as of before the failed write (review on #6).
+TEST(CraftClient, N3_LoginEmptiesAHoleAndKeepsTheWritesAfterIt) {
+    auto cl = make_cluster(3);
+    auto v0 = page_of(0x70);
+    ASSERT_TRUE(wr(*cl.client, 7, v0)); // dLSN 0: acked
+
+    cl.set.net->set_op_timeout(std::chrono::milliseconds{20});
+    cl.set.net->set_delay(craft::mem_replica_id(cl.vid, 0), std::chrono::seconds{1}); // stuck, lands late
+    cl.set.net->force_subquorum({craft::mem_replica_id(cl.vid, 0)});                  // 1 and 2 refuse outright
+    auto v1 = page_of(0x71);
+    EXPECT_FALSE(wr(*cl.client, 7, v1)); // dLSN 1: failed, and no member holds it
+    cl.set.net->clear_faults();
+    cl.set.net->set_op_timeout(std::chrono::seconds{5});
+
+    auto v2 = page_of(0x72);
+    ASSERT_TRUE(wr(*cl.client, 8, v2)); // dLSN 2: acked by all three
+    EXPECT_EQ(cl.client->commit_lsn(), 0) << "pinned below the hole during the session";
+
+    auto fresh = relogin(cl, TOKEN + 1);
+    ASSERT_TRUE(rg(fresh->flush(nullptr)).has_value());
+    EXPECT_EQ(fresh->commit_lsn(), 2) << "the hole is Empty, so commit advances past it to the later write";
+    EXPECT_EQ(rd(*fresh, 7), v0) << "the hole's LBA reads as of before the failed write";
+    EXPECT_EQ(rd(*fresh, 8), v2) << "the write after the hole keeps its data";
+    for (std::size_t i = 0; i < 3; ++i) {
+        // Every member serves the same image: route reads to one member at a time.
+        for (std::size_t j = 0; j < 3; ++j)
+            cl.set.replicas[j]->set_up(j == i);
+        EXPECT_EQ(rd(*fresh, 7), v0) << "member " << i;
+        EXPECT_EQ(rd(*fresh, 8), v2) << "member " << i;
+    }
+}
+
 // A member that missed a login keeps an old session's copy of a dLSN that login dropped and the next session reused.
 // When it returns, the next login must reconcile the slot to the reused (newest-term) copy, not to whichever holder
 // it scans first, and must replace the stale copy (review on #6).
