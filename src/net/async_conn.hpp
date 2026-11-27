@@ -177,7 +177,9 @@ private:
     // socket() + async IORING_OP_CONNECT on the ring; sets fd_. Returns 0 on success, <0 (-errno) on failure.
     sisl::async::light_task< int > ring_connect();
     // Send all of `data`, looping over partial sends via IORING_OP_SEND on the ring. 0 ok, <0 on error.
-    sisl::async::light_task< int > ring_send_all(std::span< uint8_t const > data);
+    // Sends all of `data` on the socket of generation `gen`, while holding the send slot of epoch `epoch`. Stops with
+    // -ECONNRESET, sending nothing more, as soon as either has moved on (see round_trip).
+    sisl::async::light_task< int > ring_send_all(std::span< uint8_t const > data, uint64_t gen, uint64_t epoch);
     // The persistent recv pump: one IORING_OP_RECV at a time; parse every complete message out of rx_ and demux
     // it by request_id to the waiting reply_slot. Re-arms until shutdown / a recv fault fails all pending. A
     // stand-alone disk_task (like ublkpp's queue_service): we steal its _coro, resume once, and destroy at

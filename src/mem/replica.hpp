@@ -282,6 +282,9 @@ protected:
     void cold_apply_login(uint64_t client_token, uint64_t term);
     void cold_truncate_above(int64_t rs_commit_lsn);
     void cold_install_slot(int64_t dlsn, MemJournalSlot s); // fill a hole; never overwrites an entry
+    // Login reconciliation: install `s` where the slot is absent, or replace an uncommitted copy written at an OLDER
+    // session term (a later login dropped it). Never touches a verdict, a committed slot, or a same/newer copy.
+    void cold_reconcile_slot(int64_t dlsn, MemJournalSlot s);
 
     // Test observability: how many reads this replica actually served. Lets a test witness read routing
     // (e.g. round-robin distribution across members). Not part of the CRAFT surface.

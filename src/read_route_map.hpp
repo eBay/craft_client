@@ -387,7 +387,6 @@ public:
     bool try_begin_keepalive(std::size_t idx, uint64_t gen = 0) { return try_begin(ka_inflight_[idx], gen); }
     void end_keepalive(std::size_t idx, uint64_t gen = 0) { end(ka_inflight_[idx], gen); }
 
-
     // Observability / tests.
     int64_t folded() const { return folded_.load(std::memory_order_acquire); }
     // The set-wide journal reclaim floor: min commit_lsn across members (client_hdr.all_committed_lsn).

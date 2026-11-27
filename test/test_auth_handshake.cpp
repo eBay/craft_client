@@ -702,6 +702,39 @@ TEST(CraftAuthHandshake, OnRingStaleSendCannotReleaseANewerFramesSlot) {
     replica.join();
 }
 
+// A frame whose short send completes after the connection was torn down and replaced must not send its remaining
+// bytes on the newer socket: it does not own that socket or the send slot (review on craft_client #6).
+TEST(CraftAuthHandshake, OnRingLateShortSendStopsAfterAReconnect) {
+    auto rs = replica_script{};
+    rs.enforce = false;
+    rs.connections = 2;
+    scripted_replica replica{rs};
+    {
+        ring_session ring{replica.port(), std::nullopt};
+        ASSERT_TRUE(ring.ready().has_value());
+
+        auto* conn = ring.conn.get();
+        int calls = 0;
+        ring.conn->set_send_fault_for_test([&, conn](std::size_t, std::size_t) -> long {
+            if (++calls == 1) return 10; // a positive short send of the first 10 bytes
+            // Before the rest goes out, the pump fails the connection and a reconnect replaces the socket.
+            conn->fail_all_for_test();
+            conn->bump_conn_gen_for_test();
+            return 0;
+        });
+        auto a = std::make_shared< ka_result >();
+        issue_conn_keep_alive(ring.conn.get(), a).detach();
+        ASSERT_TRUE(ring.driver.drive_until([&] { return a->has_value(); }));
+        ASSERT_FALSE(a->value().has_value());
+        EXPECT_EQ(a->value().error(), net::net_error::send)
+            << "the frame stopped before its remaining bytes, instead of sending them and waiting for a reply";
+        EXPECT_EQ(calls, 2) << "no further send was attempted";
+        ring.conn->set_send_fault_for_test(nullptr);
+        ring.driver.drain_for(std::chrono::milliseconds{50});
+    }
+    replica.join();
+}
+
 // An op queued for the send slot when the connection is torn down never sends anything: it fails with `send`
 // (provably never delivered), not `closed` (delivery uncertain) -- callers retire a never-delivered write's slot
 // instead of pinning it until the next login (review on craft_client #6).

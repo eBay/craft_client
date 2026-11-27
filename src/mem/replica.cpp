@@ -555,6 +555,18 @@ void MemCraftReplica::cold_install_slot(int64_t dlsn, MemJournalSlot s) {
     state_.last_append_lsn = std::max(state_.last_append_lsn, dlsn);
 }
 
+void MemCraftReplica::cold_reconcile_slot(int64_t dlsn, MemJournalSlot s) {
+    std::lock_guard< std::mutex > g{mu_};
+    if (auto it = journal_->find(dlsn); it != journal_->end()) {
+        // Below or at commit_lsn the slot is applied to the index and certified: it is the live copy.
+        if (dlsn <= state_.commit_lsn || it->second.is_empty || it->second.term >= s.term) return;
+        it->second = std::move(s); // journal only: an uncommitted slot is not in the index yet
+        return;
+    }
+    (*journal_)[dlsn] = std::move(s);
+    state_.last_append_lsn = std::max(state_.last_append_lsn, dlsn);
+}
+
 void MemCraftReplica::cold_mark_empty(int64_t dlsn) {
     std::lock_guard< std::mutex > g{mu_};
     // Overwrites held data on purpose: the verdict says the slot was never quorum-durable, so a sub-quorum

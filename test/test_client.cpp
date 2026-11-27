@@ -323,6 +323,35 @@ TEST(CraftClient, N3_NextLoginDropsAFailedWriteNobodyHolds) {
         EXPECT_EQ(r->stats().journal_slots, 1u);
 }
 
+// A member that missed a login keeps an old session's copy of a dLSN that login dropped and the next session reused.
+// When it returns, the next login must reconcile the slot to the reused (newest-term) copy, not to whichever holder
+// it scans first, and must replace the stale copy (review on #6).
+TEST(CraftClient, N5_LoginPrefersTheReusedSlotOverAStaleCopy) {
+    auto cl = make_cluster(5);
+    // Member 0 leads. The stale holder A is member 1, so the login scans its copy before any other; E, the member
+    // that misses the reused slot, is member 4.
+    auto const id = [&](int i) { return craft::mem_replica_id(cl.vid, i); };
+    auto v_old = page_of(0x60);
+    cl.set.net->force_subquorum({id(1)}); // only A takes dLSN 0; the other four refuse
+    EXPECT_FALSE(wr(*cl.client, 7, v_old));
+    cl.set.net->clear_faults();
+
+    cl.set.replicas[1]->set_up(false); // A misses the next login, which drops dLSN 0 (nobody live holds it)
+    auto s2 = relogin(cl, TOKEN + 1);
+    EXPECT_EQ(s2->commit_lsn(), -1);
+    auto v_new = page_of(0x61);
+    cl.set.net->force_subquorum({id(0), id(2), id(3)}); // E misses the reused slot
+    ASSERT_TRUE(wr(*s2, 7, v_new)) << "the new session reuses dLSN 0 and reaches a quorum";
+    cl.set.net->clear_faults();
+
+    cl.set.replicas[1]->set_up(true);
+    auto s3 = relogin(cl, TOKEN + 2);
+    EXPECT_GE(s3->commit_lsn(), 0);
+    for (std::size_t i : {0, 2, 3})
+        cl.set.replicas[i]->set_up(false); // only A and E left to read from
+    EXPECT_EQ(rd(*s3, 7), v_new) << "A and E both hold the reused copy, not A's stale one";
+}
+
 // An old-session write that reaches the members after the login polled them but before it resolves any slot is
 // rejected: the fence comes BEFORE the poll. Were it moved after resolution, this write could land in a slot the
 // scan saw absent, be acked, and then be voided by an Empty verdict (review on #6).

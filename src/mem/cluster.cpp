@@ -349,8 +349,11 @@ void MemTransport::resolve_slots_upto(std::vector< MemCraftReplica* > const& liv
 
     for (int64_t d = floor + 1; d <= upto; ++d) {
         // One pass over the live set: a prior Empty verdict is authoritative (it beats a held copy -- the
-        // copy was never acked); else any live holder's copy fills the others; else the whole live set
-        // (a quorum) positively lacks the slot and it is verdicted Empty everywhere.
+        // copy was never acked); else the copy written at the NEWEST session term fills the others and replaces
+        // their older copies; else the whole live set (a quorum) positively lacks the slot and it is verdicted
+        // Empty everywhere. Newest term wins: a member that missed a login can still hold an old session's copy
+        // of a dLSN that login dropped and the next session reused, and the reused copy is the live one (a
+        // login's watermark covers every durable slot, so an older copy above it was never acked).
         std::optional< MemCraftReplica::MemJournalSlot > copy;
         bool verdicted = false;
         for (auto* r : live) {
@@ -359,16 +362,15 @@ void MemTransport::resolve_slots_upto(std::vector< MemCraftReplica* > const& liv
                     verdicted = true;
                     break;
                 }
-                if (!copy) copy = std::move(s);
+                if (!copy || s->term > copy->term) copy = std::move(s);
             }
         }
         if (verdicted || !copy) {
             for (auto* r : live)
                 r->cold_mark_empty(d);
         } else {
-            for (auto* r : live) {
-                if (!r->peek_slot(d)) r->cold_install_slot(d, *copy);
-            }
+            for (auto* r : live)
+                r->cold_reconcile_slot(d, *copy);
         }
     }
 }

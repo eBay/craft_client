@@ -142,7 +142,8 @@ sisl::async::light_task< int > craft_async_conn::ring_connect() {
     co_return (res < 0) ? res : 0;
 }
 
-sisl::async::light_task< int > craft_async_conn::ring_send_all(std::span< uint8_t const > data) {
+sisl::async::light_task< int > craft_async_conn::ring_send_all(std::span< uint8_t const > data, uint64_t gen,
+                                                               uint64_t epoch) {
     std::size_t off = 0;
     while (off < data.size()) {
         sisl::async::cqe_awaitable ev;
@@ -152,6 +153,10 @@ sisl::async::light_task< int > craft_async_conn::ring_send_all(std::span< uint8_
             if (f < 0) co_return static_cast< int >(f);
             if (f > 0) len = std::min(len, static_cast< std::size_t >(f));
         }
+        // Re-checked before EVERY submission, not just the first: after a short send, the pump may have failed the
+        // connection and a reconnect opened a newer socket (and handed the send slot to another frame) while this
+        // frame waited for its completion. Its remaining bytes must never go out on that socket.
+        if (gen != conn_gen_ || epoch != send_epoch_) co_return -ECONNRESET;
         auto* sqe = acquire_sqe();
         if (nullptr == sqe) co_return -EAGAIN;
         ::io_uring_prep_send(sqe, fd_, data.data() + off, len, MSG_NOSIGNAL);
@@ -244,7 +249,7 @@ craft_async_conn::round_trip(wire::op o, std::span< uint8_t const > op_hdr, std:
     }
     uint64_t const epoch = send_epoch_; // our ownership of the send slot
     uint64_t const gen = conn_gen_;     // the connection this frame goes out on
-    int const sr = co_await ring_send_all(out);
+    int const sr = co_await ring_send_all(out, gen, epoch);
     if (sr < 0) {
         // The frame may be PARTIALLY on the socket (ring_send_all stops after a short send that errors, or when no
         // SQE is free). Keeping the connection would let the next message's bytes follow the fragment, so the server
