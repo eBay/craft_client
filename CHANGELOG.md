@@ -4,6 +4,19 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## Unreleased
+
+### Changed
+- **A failed write is resolved at the next login, not during the session.** A sub-quorum write no longer fires the
+  client-requested resolution round: the application gets the error, the slot pins the frontier, and overlapping
+  reads are served as of just before it. The next login fills the slot from a live holder or declares it Empty
+  (HomeBlocks `docs/craft/resync.md` §4.4-§4.5: mid-session verdicts raced in-flight acks). The resolution driver,
+  its want watermark, the per-member resolution gates and the replace-member resolution hand-off are removed;
+  `request_resolution` and the wire `resolve` op stay for compatibility.
+- The TCP transport drops the connection on any send failure, so a partially sent frame is never followed by the
+  next message's bytes.
+- The in-memory reference cluster's login resolves every unresolved slot up to its starting point.
+
 ## 0.6.0
 
 ### Added

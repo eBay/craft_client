@@ -77,12 +77,12 @@ client_handle make_client(std::vector< std::shared_ptr< craft_replica > > replic
 // own ring -- the transport keeps one data connection per (ring, replica), the nr_hw_queues x N grid, opened
 // lazily at each ring's first verb. AFFINITY IS YOURS, exactly as with a raw io_uring: pass a ring only from
 // the thread that owns and reaps it. One op's whole leg chain (its broadcast legs, failovers, and the
-// keep_alives/resolutions it spawns) rides the ring it was called with. A ring is remembered BY ADDRESS for
+// keep_alives it spawns) rides the ring it was called with. A ring is remembered BY ADDRESS for
 // the client's whole life (there is no unbind): every ring passed must outlive the client, and a destroyed
 // ring's address must not reappear as a new ring mid-life. Ordering contract: login (sync_get, a setup
 // thread) happens-before any queue's first verb; all queues quiesce and exit their rings before logout /
 // client teardown -- where "quiesce" includes reaping the DETACHED legs the queue's verbs spawned (straggler
-// writes, keep_alives, resolution rounds), not just its own awaited ops.
+// writes, keep_alives), not just its own awaited ops.
 
 // Establish the session, following NOT_LEADER redirects. Always blocking-tier: it brackets every ring's
 // lifetime (it learns lba/capacity/term before any queue IO exists) -- drive it with sync_get on a setup thread.
