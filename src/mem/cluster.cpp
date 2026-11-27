@@ -335,6 +335,46 @@ std::vector< MemCraftReplica* > MemTransport::live_replicas_locked() const {
     return live;
 }
 
+// The leader's resolution step over the live set (a quorum), shared by login and the resolution round: every
+// slot <= upto that is not yet contiguously present everywhere is filled from a live holder, or -- when the whole
+// live set lacks it, or a prior Empty verdict exists -- verdicted Empty everywhere. Run by login under the
+// session switch, this is where a failed (sub-quorum) write is resolved: it completes late if any live member
+// holds it, and is voided otherwise (HomeBlocks docs/craft/resync.md §4.4).
+void MemTransport::resolve_slots_upto(std::vector< MemCraftReplica* > const& live, int64_t upto) {
+    // Everything <= a member's commit_lsn is contiguously present there, so the min over the live set bounds
+    // the scan: below it nothing can be unresolved.
+    int64_t floor = std::numeric_limits< int64_t >::max();
+    for (auto* r : live)
+        floor = std::min(floor, r->peek_lsns().commit_lsn);
+
+    for (int64_t d = floor + 1; d <= upto; ++d) {
+        // One pass over the live set: a prior Empty verdict is authoritative (it beats a held copy -- the
+        // copy was never acked); else the copy written at the NEWEST session term fills the others and replaces
+        // their older copies; else the whole live set (a quorum) positively lacks the slot and it is verdicted
+        // Empty everywhere. Newest term wins: a member that missed a login can still hold an old session's copy
+        // of a dLSN that login dropped and the next session reused, and the reused copy is the live one (a
+        // login's watermark covers every durable slot, so an older copy above it was never acked).
+        std::optional< MemCraftReplica::MemJournalSlot > copy;
+        bool verdicted = false;
+        for (auto* r : live) {
+            if (auto s = r->peek_slot(d)) {
+                if (s->is_empty) {
+                    verdicted = true;
+                    break;
+                }
+                if (!copy || s->term > copy->term) copy = std::move(s);
+            }
+        }
+        if (verdicted || !copy) {
+            for (auto* r : live)
+                r->cold_mark_empty(d);
+        } else {
+            for (auto* r : live)
+                r->cold_reconcile_slot(d, *copy);
+        }
+    }
+}
+
 result< LoginResult > MemTransport::run_login(MemCraftReplica* caller, uint64_t client_token) {
     std::vector< MemCraftReplica* > live;
     std::vector< replica_endpoint > members_copy;
@@ -349,10 +389,21 @@ result< LoginResult > MemTransport::run_login(MemCraftReplica* caller, uint64_t 
         members_copy = members_;
     }
     // Drive the cold path WITHOUT holding mu_ (each replica call takes only its own lock).
+    // Phase 0: fence. Every live replica switches to the new term BEFORE it is polled, so from here on it rejects
+    // the old session's writes: none can reach quorum after the absence scan below and then be voided by it. In
+    // this model a write is applied atomically under the replica's lock, so there is no admitted-but-unfinished
+    // write to drain; a delayed delivery that arrives later carries the old term and is rejected. Nobody writes
+    // under the new term until this login returns, so the early switch admits no one.
+    for (auto* r : live)
+        r->cold_fence(nt);
     // Phase 1: GetRSCommitLSN -> rs_commit_lsn = max(quorum.last_append_lsn).
     int64_t rs = -1;
     for (auto* r : live)
         rs = std::max(rs, r->peek_lsns().last_append_lsn);
+    if (login_poll_hook_) login_poll_hook_();
+    // Phase 1b: resolve every unresolved slot <= rs (fill from a holder, or verdict Empty) -- failed writes of the
+    // previous session are decided here, not mid-session.
+    resolve_slots_upto(live, rs);
     // Phase 2: SyncRSCommitLSN(rs) applied to all live members.
     for (auto* r : live)
         r->cold_apply_sync(rs, client_token);
@@ -379,36 +430,7 @@ result< resolution_result > MemTransport::run_resolution(MemCraftReplica* caller
         if (live.size() < quorum(members_.size())) return fail(craft_error::NO_QUORUM);
     }
 
-    // Everything <= a member's commit_lsn is contiguously present there, so the min over the live set bounds
-    // the scan: below it nothing can be unresolved.
-    int64_t floor = std::numeric_limits< int64_t >::max();
-    for (auto* r : live)
-        floor = std::min(floor, r->peek_lsns().commit_lsn);
-
-    for (int64_t d = floor + 1; d <= upto; ++d) {
-        // One pass over the live set: a prior Empty verdict is authoritative (it beats a held copy -- the
-        // copy was never acked); else any live holder's copy fills the others; else the whole live set
-        // (a quorum) positively lacks the slot and it is verdicted Empty everywhere.
-        std::optional< MemCraftReplica::MemJournalSlot > copy;
-        bool verdicted = false;
-        for (auto* r : live) {
-            if (auto s = r->peek_slot(d)) {
-                if (s->is_empty) {
-                    verdicted = true;
-                    break;
-                }
-                if (!copy) copy = std::move(s);
-            }
-        }
-        if (verdicted || !copy) {
-            for (auto* r : live)
-                r->cold_mark_empty(d);
-        } else {
-            for (auto* r : live) {
-                if (!r->peek_slot(d)) r->cold_install_slot(d, *copy);
-            }
-        }
-    }
+    resolve_slots_upto(live, upto);
     for (auto* r : live)
         r->cold_apply_sync(upto, 0);
 

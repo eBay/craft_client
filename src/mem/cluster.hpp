@@ -157,8 +157,13 @@ public:
     // How long the transport waits before abandoning an op. 0 (the default) means wait forever, which is
     // the model's original behavior: without it a delay merely slows the client down.
     void set_op_timeout(std::chrono::milliseconds t);
+    // Test seam: run by the model login right after it fenced and polled the live members, before it resolves any
+    // slot -- lets a test deliver an old-session write exactly between the poll and the Empty verdicts.
+    void set_login_poll_hook_for_test(std::function< void() > f) { login_poll_hook_ = std::move(f); }
 
 private:
+    // Leader resolution step over the live set, shared by run_login and run_resolution (see cluster.cpp).
+    static void resolve_slots_upto(std::vector< MemCraftReplica* > const& live, int64_t upto);
     // What a suspended op resumes on. Single-shot and completed from a service thread; the awaiting
     // coroutine resumes there, which is why nothing here may hold mu_ across a co_await.
     using sleep_event = sisl::async::shared_awaitable< std::monostate >;
@@ -227,6 +232,7 @@ private:
 
     // The client's set-wide deadline (0 == wait forever). NOT a replica fault; read lock-free on the IO path.
     std::atomic< int64_t > op_timeout_ms_{0};
+    std::function< void() > login_poll_hook_; // test seam only
 
     // Built once in the ctor from members_ and never rehashed, so a replica_service* stays stable and the
     // per-pool locks need no protection from mu_.

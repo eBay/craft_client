@@ -90,24 +90,21 @@ std::vector< uint8_t > rd(craft::craft_client& c, uint64_t off_blk, uint64_t nbl
     return dest;
 }
 
-// Only the leader accepts the write, so it journals the slot while quorum(3)=2 goes unmet: the slot fails --
-// and the failure fires the client-requested resolution round, which (leader up, quorum live) FILLS the slot
-// from the leader's copy and retires it: the failed write completes late, durable everywhere. Use this to
-// exercise the round; use write_subquorum_unhealed for the unresolved WINDOW.
+// Only the leader accepts the write, so it journals the slot while quorum(3)=2 goes unmet: the write fails and
+// the slot stays unresolved for the rest of the session (failed writes are resolved at the next login).
 void write_subquorum(Cluster& cl, uint64_t off_blk, std::vector< uint8_t >& buf) {
     cl.set.net->force_subquorum({craft::mem_replica_id(cl.vid, 0)});
     EXPECT_FALSE(wr(*cl.client, off_blk, buf));
     cl.set.net->clear_faults();
 }
 
-// Fail a write sub-quorum WITHOUT letting the resolution round heal it: the LEADER is down for the write, so
-// the round (leader-only) dies with REPLICA_DOWN and the slot stays unresolved -- the fencing window the
-// horizon tests pin. Replica 1 is the surviving sub-quorum holder.
+// Fail a write sub-quorum with the LEADER down for it, so replica 1 is the only holder -- the unresolved
+// window the horizon tests pin.
 void write_subquorum_unhealed(Cluster& cl, uint64_t off_blk, std::vector< uint8_t >& buf) {
     cl.set.replicas[0]->set_up(false);
     cl.set.net->force_subquorum({craft::mem_replica_id(cl.vid, 1)});
     EXPECT_FALSE(wr(*cl.client, off_blk, buf));
-    cl.set.net->clear_faults(); // everyone healthy again -- but nothing re-fires the dead round
+    cl.set.net->clear_faults(); // everyone healthy again -- the slot stays unresolved until the next login
 }
 } // namespace
 
@@ -250,44 +247,177 @@ TEST(CraftClient, N3_SplitReadServesEachBlockAtItsOwnHorizon) {
     EXPECT_EQ(cl.client->commit_lsn(), 0) << "the failed write still pins commit";
 }
 
-// --- the client-requested resolution round: a failed write is resolved NOW, not at the next login ---
+// --- failed writes: resolved at the next login, never during the session (HomeBlocks docs/craft/resync.md §4.4) ---
 
-// The round FILLS the slot: the leader holds the sub-quorum copy, so the round fetches it everywhere and the
-// failed write completes late (the design's benign false-include). The frontier releases immediately -- the
-// round runs synchronously in the in-process model -- and the value becomes the durable version of the block.
-TEST(CraftClient, N3_ResolutionRoundFillsAFailedWriteAndReleasesTheFrontier) {
+namespace {
+// A fresh client logging into the same replicas (the "next attach").
+std::shared_ptr< craft::craft_client > relogin(Cluster& cl, uint64_t token) {
+    std::vector< std::shared_ptr< craft::craft_replica > > backends(cl.set.replicas.begin(), cl.set.replicas.end());
+    auto fresh = std::make_shared< craft::craft_client >(std::move(backends));
+    EXPECT_TRUE(rg(fresh->login(token)).has_value());
+    return fresh;
+}
+} // namespace
+
+// A failed write is NOT resolved during the session: no resolution request is sent, the slot pins the
+// frontier, the other members never receive it, and overlapping reads are still served (old data).
+TEST(CraftClient, N3_FailedWriteIsNotResolvedDuringTheSession) {
     auto cl = make_cluster(3);
     auto v0 = page_of(0x40);
     auto v1 = page_of(0x41);
 
     ASSERT_TRUE(wr(*cl.client, 4, v0)); // dLSN 0
-    EXPECT_EQ(cl.client->commit_lsn(), 0);
-    write_subquorum(cl, 4, v1); // dLSN 1 fails; the round fires, fills from the leader, retires the slot
+    write_subquorum(cl, 4, v1);         // dLSN 1 fails: only the leader journals it
 
-    EXPECT_EQ(cl.client->commit_lsn(), 1) << "the round resolved the slot; nothing pins the frontier";
-    EXPECT_EQ(rd(*cl.client, 4), v1) << "the failed write completed late: it IS the durable version now";
-
-    // Every live member ends up holding the filled slot (the model's round pushes synchronously).
-    for (auto& r : cl.set.replicas)
-        EXPECT_EQ(r->stats().journal_slots, 2u);
+    EXPECT_EQ(cl.client->commit_lsn(), 0) << "the failed write pins the frontier for the rest of the session";
+    EXPECT_EQ(rd(*cl.client, 4), v0) << "an overlapping read is served as of just before the failed write";
+    // Checked by position, not by slot count: a keep_alive may let a member reclaim dLSN 0 from its journal.
+    EXPECT_EQ(cl.set.replicas[1]->stats().last_append_lsn, 0) << "no mid-session round copied the slot";
+    EXPECT_EQ(cl.set.replicas[2]->stats().last_append_lsn, 0);
 }
 
-// The round declares EMPTY: nobody holds the slot (the one copy is stuck in a 10s-delayed transport), so the
-// leader verdicts it Empty on quorum-lacks evidence and tombstones it -- the late arrival is then REJECTED
-// (reconciliation: Empty beats data), so no replica can resurrect a voided write.
-TEST(CraftClient, N3_ResolutionRoundVerdictsEmptyWhenNobodyHoldsTheSlot) {
+// The next login resolves it: a live member holds the slot, so it is filled everywhere -- the failed write
+// completed late (the design's benign false-include) and the frontier passes it.
+TEST(CraftClient, N3_NextLoginFillsAFailedWriteHeldByALiveMember) {
+    auto cl = make_cluster(3);
+    auto v0 = page_of(0x40);
+    auto v1 = page_of(0x41);
+    ASSERT_TRUE(wr(*cl.client, 4, v0));
+    write_subquorum(cl, 4, v1);
+
+    auto fresh = relogin(cl, TOKEN + 1);
+    EXPECT_EQ(fresh->commit_lsn(), 1) << "login resolved slot 1";
+    EXPECT_EQ(rd(*fresh, 4), v1) << "the failed write completed late: it is the durable version now";
+    for (auto& r : cl.set.replicas) {
+        EXPECT_EQ(r->stats().journal_last_dlsn, 1) << "every live member holds the filled slot";
+        EXPECT_EQ(r->stats().empty_slots, 0u) << "filled, not Emptied";
+    }
+}
+
+// When no live member holds the failed write (its only copy is stuck in a 1 s-delayed transport), no replica's
+// last_append covers it, so the next login's starting point is below it: the write simply never happened, and
+// the new session reuses the dLSN. The late arrival carries the old term and is fenced out -- the test waits for
+// it to land and checks the reused slot afterwards.
+TEST(CraftClient, N3_NextLoginDropsAFailedWriteNobodyHolds) {
     auto cl = make_cluster(3);
     cl.set.net->set_op_timeout(std::chrono::milliseconds{20});
-    cl.set.net->set_delay(craft::mem_replica_id(cl.vid, 0), std::chrono::seconds{10}); // stuck, lands late
-    cl.set.net->force_subquorum({craft::mem_replica_id(cl.vid, 0)});                   // 1 and 2 refuse outright
+    cl.set.net->set_delay(craft::mem_replica_id(cl.vid, 0), std::chrono::seconds{1}); // stuck, lands late
+    cl.set.net->force_subquorum({craft::mem_replica_id(cl.vid, 0)});                  // 1 and 2 refuse outright
 
     auto v = page_of(0x50);
     EXPECT_FALSE(wr(*cl.client, 7, v)); // leg 0 times out, legs 1-2 refuse -> failed (not provably absent)
     cl.set.net->clear_faults();
+    EXPECT_EQ(cl.client->commit_lsn(), -1) << "unresolved during the session";
 
-    EXPECT_EQ(cl.client->commit_lsn(), 0) << "the round verdicted dLSN 0 Empty and the frontier passed it";
-    EXPECT_EQ(rd(*cl.client, 7), page_of(0)) << "a voided write reads as never-written";
-    EXPECT_GE(cl.set.replicas[1]->stats().empty_slots, 1u) << "the verdict tombstone is journaled";
+    auto fresh = relogin(cl, TOKEN + 1);
+    EXPECT_EQ(fresh->commit_lsn(), -1) << "nobody holds dLSN 0, so the login starting point is below it";
+    EXPECT_EQ(rd(*fresh, 7), page_of(0)) << "the failed write reads as never-written";
+    auto w = page_of(0x51);
+    ASSERT_TRUE(wr(*fresh, 7, w)) << "the new session reuses dLSN 0";
+    EXPECT_EQ(rd(*fresh, 7), w);
+
+    // Wait for the old write's delayed delivery to replica 0, then check it changed nothing (review on #6).
+    auto const deadline = std::chrono::steady_clock::now() + std::chrono::seconds{5};
+    while (cl.set.replicas[0]->stats().stale_term_writes == 0 && std::chrono::steady_clock::now() < deadline)
+        std::this_thread::sleep_for(std::chrono::milliseconds{10});
+    ASSERT_EQ(cl.set.replicas[0]->stats().stale_term_writes, 1u) << "the late old-session write was delivered";
+    EXPECT_EQ(rd(*fresh, 7), w) << "and rejected: the reused slot keeps the new session's data";
+    for (auto& r : cl.set.replicas) {
+        EXPECT_EQ(r->stats().last_append_lsn, 0) << "only the reused dLSN 0, nothing from the old session";
+        EXPECT_EQ(r->stats().journal_last_dlsn, 0);
+    }
+}
+
+// The login's Empty verdict for a hole BELOW later writes: a failed write nobody holds sits between two acked ones.
+// The login declares it Empty on every member, its commit advances past it to the newest write, the later write
+// keeps its data, and the hole's LBA reads as of before the failed write (review on #6).
+TEST(CraftClient, N3_LoginEmptiesAHoleAndKeepsTheWritesAfterIt) {
+    auto cl = make_cluster(3);
+    auto v0 = page_of(0x70);
+    ASSERT_TRUE(wr(*cl.client, 7, v0)); // dLSN 0: acked
+
+    cl.set.net->set_op_timeout(std::chrono::milliseconds{20});
+    cl.set.net->set_delay(craft::mem_replica_id(cl.vid, 0), std::chrono::seconds{1}); // stuck, lands late
+    cl.set.net->force_subquorum({craft::mem_replica_id(cl.vid, 0)});                  // 1 and 2 refuse outright
+    auto v1 = page_of(0x71);
+    EXPECT_FALSE(wr(*cl.client, 7, v1)); // dLSN 1: failed, and no member holds it
+    cl.set.net->clear_faults();
+    cl.set.net->set_op_timeout(std::chrono::seconds{5});
+
+    auto v2 = page_of(0x72);
+    ASSERT_TRUE(wr(*cl.client, 8, v2)); // dLSN 2: acked by all three
+    EXPECT_EQ(cl.client->commit_lsn(), 0) << "pinned below the hole during the session";
+
+    auto fresh = relogin(cl, TOKEN + 1);
+    ASSERT_TRUE(rg(fresh->flush(nullptr)).has_value());
+    EXPECT_EQ(fresh->commit_lsn(), 2) << "the hole is Empty, so commit advances past it to the later write";
+    EXPECT_EQ(rd(*fresh, 7), v0) << "the hole's LBA reads as of before the failed write";
+    EXPECT_EQ(rd(*fresh, 8), v2) << "the write after the hole keeps its data";
+    for (std::size_t i = 0; i < 3; ++i) {
+        // Every member serves the same image: route reads to one member at a time.
+        for (std::size_t j = 0; j < 3; ++j)
+            cl.set.replicas[j]->set_up(j == i);
+        EXPECT_EQ(rd(*fresh, 7), v0) << "member " << i;
+        EXPECT_EQ(rd(*fresh, 8), v2) << "member " << i;
+    }
+}
+
+// A member that missed a login keeps an old session's copy of a dLSN that login dropped and the next session reused.
+// When it returns, the next login must reconcile the slot to the reused (newest-term) copy, not to whichever holder
+// it scans first, and must replace the stale copy (review on #6).
+TEST(CraftClient, N5_LoginPrefersTheReusedSlotOverAStaleCopy) {
+    auto cl = make_cluster(5);
+    // Member 0 leads. The stale holder A is member 1, so the login scans its copy before any other; E, the member
+    // that misses the reused slot, is member 4.
+    auto const id = [&](int i) { return craft::mem_replica_id(cl.vid, i); };
+    auto v_old = page_of(0x60);
+    cl.set.net->force_subquorum({id(1)}); // only A takes dLSN 0; the other four refuse
+    EXPECT_FALSE(wr(*cl.client, 7, v_old));
+    cl.set.net->clear_faults();
+
+    cl.set.replicas[1]->set_up(false); // A misses the next login, which drops dLSN 0 (nobody live holds it)
+    auto s2 = relogin(cl, TOKEN + 1);
+    EXPECT_EQ(s2->commit_lsn(), -1);
+    auto v_new = page_of(0x61);
+    cl.set.net->force_subquorum({id(0), id(2), id(3)}); // E misses the reused slot
+    ASSERT_TRUE(wr(*s2, 7, v_new)) << "the new session reuses dLSN 0 and reaches a quorum";
+    cl.set.net->clear_faults();
+
+    cl.set.replicas[1]->set_up(true);
+    auto s3 = relogin(cl, TOKEN + 2);
+    EXPECT_GE(s3->commit_lsn(), 0);
+    for (std::size_t i : {0, 2, 3})
+        cl.set.replicas[i]->set_up(false); // only A and E left to read from
+    EXPECT_EQ(rd(*s3, 7), v_new) << "A and E both hold the reused copy, not A's stale one";
+}
+
+// An old-session write that reaches the members after the login polled them but before it resolves any slot is
+// rejected: the fence comes BEFORE the poll. Were it moved after resolution, this write could land in a slot the
+// scan saw absent, be acked, and then be voided by an Empty verdict (review on #6).
+TEST(CraftClient, N3_OldSessionWriteBetweenPollAndResolutionIsRejected) {
+    auto cl = make_cluster(3);
+    auto v = page_of(0x60);
+    ASSERT_TRUE(wr(*cl.client, 1, v)); // dLSN 0
+    uint64_t const old_term = cl.client->term();
+
+    auto late = page_of(0x61);
+    int rejected = 0;
+    cl.set.net->set_login_poll_hook_for_test([&] {
+        for (auto& r : cl.set.replicas) {
+            auto res = rg(r->write(nullptr, client_hdr{.term = old_term, .commit_lsn = 0, .all_committed_lsn = 0},
+                                   /*dlsn=*/1, blk(2), PAGE, one_iov(late)));
+            if (!res && res.error() == make_error_condition(craft_error::STALE_TERM)) ++rejected;
+        }
+    });
+    auto fresh = relogin(cl, TOKEN + 1);
+    cl.set.net->set_login_poll_hook_for_test(nullptr);
+
+    EXPECT_EQ(rejected, 3);
+    for (auto& r : cl.set.replicas)
+        EXPECT_EQ(r->stats().stale_term_writes, 1u);
+    EXPECT_EQ(fresh->commit_lsn(), 0);
+    EXPECT_EQ(rd(*fresh, 2), page_of(0)) << "the late write never landed";
+    EXPECT_EQ(rd(*fresh, 1), v);
 }
 
 // --- session establishment ---
@@ -742,8 +872,12 @@ TEST(CraftClient, ReLoginMustNotServeStaleFollower) {
 
     // Re-login drops the Missing map; member 2 is now gated only by Synced, which the client seeds from member
     // 2's own commit_lsn (< L, since it never applied dLSN 1) -- so it stays ineligible despite still holding 0xAA.
+    // Member 2 is DOWN during the login: a live member would be healed by the login's resolution step (filled
+    // from a holder), and this test is about a member that is still behind afterwards.
     ASSERT_TRUE(rg(cl.client->logout()).has_value());
+    cl.set.replicas[2]->set_up(false);
     ASSERT_TRUE(rg(cl.client->login(TOKEN)).has_value());
+    cl.set.replicas[2]->set_up(true);
     EXPECT_FALSE(cl.client->route_caught_up(2)) << "member 2 still behind after re-login -- must not be trusted";
 
     // Every read must return the committed 0xBB. Read enough times that the round-robin rotor would visit all
@@ -1081,32 +1215,17 @@ TEST(ReadRouteMap, ResolutionByAReplacedBackendDoesNotCreditTheNewMember) {
     EXPECT_TRUE(m.eligible(2, blk(0), PAGE, 0));
 }
 
-// The per-leg gates are generation-scoped: a leg still out to a replaced backend neither
+// The keep_alive gate is generation-scoped: a leg still out to a replaced backend neither
 // blocks a leg to the slot's new backend nor, when it completes, releases the new leg's gate.
 TEST(ReadRouteMap, LegGatesAreGenerationScoped) {
     craft::read_route_map m;
     m.reset(3, /*L=*/-1);
-    EXPECT_TRUE(m.try_begin_resolution(1, /*gen=*/0)) << "leg to the old backend";
-    EXPECT_FALSE(m.try_begin_resolution(1, 0)) << "same generation: collapsed";
-    EXPECT_TRUE(m.try_begin_resolution(1, 1)) << "the new backend's leg may start while the old one is out";
-    EXPECT_FALSE(m.try_begin_resolution(1, 1));
-    EXPECT_FALSE(m.try_begin_resolution(1, 0)) << "an older generation cannot take a newer leg's gate";
-    m.end_resolution(1, 0); // the old leg completes late
-    EXPECT_FALSE(m.try_begin_resolution(1, 1)) << "...and does not release the new leg's gate";
-    m.end_resolution(1, 1);
-    EXPECT_TRUE(m.try_begin_resolution(1, 1)) << "released by its owner";
-
     EXPECT_TRUE(m.try_begin_keepalive(2, 0));
-    EXPECT_TRUE(m.try_begin_keepalive(2, 1)) << "same rule for keep_alives";
+    EXPECT_TRUE(m.try_begin_keepalive(2, 1)) << "the new backend's leg may start while the old one is out";
     m.end_keepalive(2, 0);
     EXPECT_FALSE(m.try_begin_keepalive(2, 1));
     m.end_keepalive(2, 1);
     EXPECT_TRUE(m.try_begin_keepalive(2, 1));
-
-    EXPECT_FALSE(m.take_resolution_handoff(0)) << "no hand-off pending";
-    m.note_resolution_handoff(0); // an old leg stopped with a want pending
-    EXPECT_TRUE(m.take_resolution_handoff(0));
-    EXPECT_FALSE(m.take_resolution_handoff(0)) << "taken once";
 }
 
 // With a single member, replacing it leaves no eligible reader. A read that finds no eligible
@@ -1286,26 +1405,23 @@ TEST(CraftClient, ALaggingReplacementIsKeptOutOfReads) {
     EXPECT_EQ(lagging->reads.load(), 0) << "no read is routed to a member that lacks the data";
 }
 
-// A resolution want pending across a swap reaches the slot's NEW backend without another failed write. Here the
-// round died with the leader down (write_subquorum_unhealed), so without a swap the frontier stays pinned (see
-// N3_AckedOverwriteShadowsAFailedWrite); swapping the leader's slot hands the want to the new backend, and the next
-// write fires it.
-TEST(CraftClient, AWantPendingAcrossASwapReachesTheNewBackend) {
+// A failed write stays unresolved across a swap: no resolution request reaches the slot's new backend (or any
+// other) during the session, and the frontier stays pinned until the next login resolves the slot.
+TEST(CraftClient, AFailedWriteStaysUnresolvedAcrossASwap) {
     auto cl = make_cluster(3);
     auto v0 = page_of(0x50);
     auto v1 = page_of(0x51);
     auto v2 = page_of(0x52);
     ASSERT_TRUE(wr(*cl.client, 7, v0));  // dLSN 0
-    write_subquorum_unhealed(cl, 7, v1); // dLSN 1: failed, round dead, want pending
+    write_subquorum_unhealed(cl, 7, v1); // dLSN 1: failed
     ASSERT_EQ(cl.client->commit_lsn(), 0) << "pinned by the unresolved slot";
 
     auto fresh = std::make_shared< counting_replica >(cl.set.replicas[0]); // the leader's slot, new proxy
     ASSERT_FALSE(cl.client->replace_member(cl.set.replicas[0]->id(), fresh));
-    ASSERT_TRUE(wr(*cl.client, 8, v2)); // a healthy write: picks up the hand-off
-    EXPECT_GT(fresh->resolutions.load(), 0) << "the pending want reached the new backend";
-    EXPECT_EQ(fresh->resolution_token.load(), TOKEN) << "with the session's client_token, which its HELO presents";
+    ASSERT_TRUE(wr(*cl.client, 8, v2)); // a healthy write after the swap
     ASSERT_TRUE(rg(cl.client->flush(nullptr)).has_value());
-    EXPECT_EQ(cl.client->commit_lsn(), 2) << "the frontier is no longer pinned";
+    EXPECT_EQ(fresh->resolutions.load(), 0) << "no mid-session resolution";
+    EXPECT_EQ(cl.client->commit_lsn(), 0) << "still pinned: the next login resolves it";
 }
 
 TEST(CraftClient, ReplaceMemberRejectsBadArguments) {

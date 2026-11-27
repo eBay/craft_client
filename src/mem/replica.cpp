@@ -237,7 +237,10 @@ result< lsn_pair > MemCraftReplica::do_write(client_hdr hdr, int64_t dlsn, uint6
         return std::unexpected(std::make_error_condition(std::errc::invalid_argument));
     }
     std::lock_guard< std::mutex > g{mu_};
-    if (hdr.term != state_.term) return fail(craft_error::STALE_TERM);
+    if (hdr.term != state_.term) {
+        ++stale_term_writes_;
+        return fail(craft_error::STALE_TERM);
+    }
     if (auto it = journal_->find(dlsn); it != journal_->end() && it->second.is_empty) {
         // An Empty verdict is permanent (reconciliation: Empty beats data). A late arrival into the slot is
         // REJECTED -- deterministically -- so that write's own ack path concludes the slot is void, matching
@@ -458,6 +461,7 @@ replica_stats MemCraftReplica::stats() const {
     s.term = state_.term;
     s.client_token = state_.client_token;
     s.mapped_blocks = index_->size();
+    s.stale_term_writes = stale_term_writes_;
 
     s.journal_slots = journal_->size();
     if (!journal_->empty()) {
@@ -511,6 +515,11 @@ void MemCraftReplica::cold_apply_sync(int64_t rs_commit_lsn, uint64_t /*client_t
     // SyncRSCommitLSN: (seam) fetch any missing non-Empty slots <= rs from peers, then advance commit.
     apply_up_to(rs_commit_lsn);
 }
+void MemCraftReplica::cold_fence(uint64_t term) {
+    std::lock_guard< std::mutex > g{mu_};
+    state_.term = term; // old-session writes now fail STALE_TERM; the session itself is installed by cold_apply_login
+    on_state_changed();
+}
 void MemCraftReplica::cold_apply_login(uint64_t client_token, uint64_t term) {
     std::lock_guard< std::mutex > g{mu_};
     state_.client_token = client_token;
@@ -542,6 +551,18 @@ std::optional< MemCraftReplica::MemJournalSlot > MemCraftReplica::peek_slot(int6
 void MemCraftReplica::cold_install_slot(int64_t dlsn, MemJournalSlot s) {
     std::lock_guard< std::mutex > g{mu_};
     if (journal_->contains(dlsn)) return; // already holds it (or a verdict); a fetch never overwrites
+    (*journal_)[dlsn] = std::move(s);
+    state_.last_append_lsn = std::max(state_.last_append_lsn, dlsn);
+}
+
+void MemCraftReplica::cold_reconcile_slot(int64_t dlsn, MemJournalSlot s) {
+    std::lock_guard< std::mutex > g{mu_};
+    if (auto it = journal_->find(dlsn); it != journal_->end()) {
+        // Below or at commit_lsn the slot is applied to the index and certified: it is the live copy.
+        if (dlsn <= state_.commit_lsn || it->second.is_empty || it->second.term >= s.term) return;
+        it->second = std::move(s); // journal only: an uncommitted slot is not in the index yet
+        return;
+    }
     (*journal_)[dlsn] = std::move(s);
     state_.last_append_lsn = std::max(state_.last_append_lsn, dlsn);
 }
