@@ -70,6 +70,7 @@
 #include <array>
 #include <atomic>
 #include <bit>
+#include <chrono>
 #include <cassert>
 #include <cstddef>
 #include <cstdint>
@@ -84,6 +85,8 @@
 #include <boost/icl/interval_map.hpp>
 
 #include <sisl/fds/stream_tracker.hpp>
+
+#include <craft/client.hpp> // leg_observer, leg_sample
 
 namespace craft {
 
@@ -114,6 +117,17 @@ class read_route_map {
     using missing_map = boost::icl::interval_map< uint64_t, int64_t, boost::icl::partial_enricher >;
 
 public:
+    // ── per-member latency (craft::set_leg_observer) ── Hosted here because every leg holds this map by shared_ptr,
+    // including stragglers that outlive the client. Set before the first IO, never changed during IO.
+    void set_leg_observer(leg_observer obs) { leg_observer_ = std::move(obs); }
+    bool timing_legs() const noexcept { return static_cast< bool >(leg_observer_); }
+    void observe_leg(std::size_t idx, leg_op op, std::chrono::steady_clock::time_point start, bool ok) const {
+        if (!leg_observer_) return;
+        auto const us =
+            std::chrono::duration_cast< std::chrono::microseconds >(std::chrono::steady_clock::now() - start);
+        leg_observer_(leg_sample{idx, op, static_cast< uint64_t >(us.count()), ok});
+    }
+
     // (Re-)seed for a session of `n` members with login dLSN `L` (the frontier; the overlay starts at L+1). The
     // login barrier does NOT make everything <= L universally held -- it guarantees only quorum durability +
     // leader completeness, so a live member may still hold a hole <= L. Each member's Synced baseline therefore
@@ -479,6 +493,7 @@ private:
         g.compare_exchange_strong(mine, 0, std::memory_order_release, std::memory_order_relaxed);
     }
 
+    leg_observer leg_observer_;                   // set once before IO (set_leg_observer)
     std::mutex pending_mu_;                       // guards pending_
     std::vector< pending_miss > pending_;         // durable non-universal completed slots awaiting fold
     std::atomic< int64_t > pending_hint_{kNever}; // conservative min pending dLSN; the fold fast-path gate

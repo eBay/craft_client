@@ -104,6 +104,7 @@ async_status craft_client::login(uint64_t client_token) {
         // record_completion after we return -- reconstructing the live map under it would race. The old map is
         // orphaned and freed once its last straggler finishes.
         route_ = std::make_shared< read_route_map >();
+        route_->set_leg_observer(leg_observer_);
         route_->reset(n, lr->dLSN);
         for (std::size_t i = 0; i < n; ++i)
             route_->set_generation(i, ms->gens[i]); // generations survive re-login
@@ -162,9 +163,12 @@ static async_result< lsn_pair > write_leg(::io_uring* q, std::shared_ptr< craft_
                                           uint64_t addr, uint64_t len, sisl::sg_list data, std::size_t idx,
                                           uint64_t gen) {
     result< lsn_pair > r = std::unexpected(make_error_condition(craft_error::REPLICA_DOWN));
+    auto const start =
+        route->timing_legs() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     try {
         r = co_await h->write(q, hdr, dlsn, addr, len, std::move(data));
     } catch (...) {}
+    route->observe_leg(idx, leg_op::write, start, r.has_value());
     route->record_completion(dlsn, idx, r.has_value());
     if (r.has_value()) route->advance_synced(idx, gen, r->commit_lsn); // any round-trip refreshes the watermark
     co_return r;
@@ -425,7 +429,10 @@ async_result< size_t > craft_client::read(::io_uring* q, uint64_t addr, uint64_t
         if (!any_eligible) read_rotor = idx + 1; // next read on this queue thread starts at the following peer
         any_eligible = true;
 
+        auto const start =
+            route_->timing_legs() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         auto r = co_await issue_plan(q, ms->backends[idx], hdr, *plan, addr, len, dest);
+        route_->observe_leg(idx, leg_op::read, start, r.has_value());
         if (r.has_value()) {
             // The reply piggybacked the serving member's watermarks: feed them to the router (this is what
             // makes "the leg we served is fresh" literally true), then top up every leg this read did NOT
@@ -459,7 +466,10 @@ async_result< size_t > craft_client::read(::io_uring* q, uint64_t addr, uint64_t
 // Fire-and-forget, so it captures the map by shared_ptr (it may outlive the client) and the backend by value.
 static async_status fire_keepalive(::io_uring* q, std::shared_ptr< craft_replica > h, client_hdr hdr,
                                    std::shared_ptr< read_route_map > route, std::size_t idx, uint64_t gen) {
+    auto const start =
+        route->timing_legs() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     auto r = co_await h->keep_alive(q, hdr);
+    route->observe_leg(idx, leg_op::keep_alive, start, r.has_value());
     if (r.has_value()) route->advance_synced(idx, gen, r->commit_lsn);
     route->end_keepalive(idx, gen);
     co_return ok();
@@ -593,6 +603,7 @@ int64_t read_horizon(client_handle const& c) { return c->read_horizon(); }
 uint64_t winner_scans(client_handle const& c) { return c->winner_scans(); }
 int64_t route_folded(client_handle const& c) { return c->route_folded(); }
 bool route_caught_up(client_handle const& c, std::size_t idx) { return c->route_caught_up(idx); }
+void set_leg_observer(client_handle const& c, leg_observer obs) { c->set_leg_observer(std::move(obs)); }
 int64_t all_committed_lsn(client_handle const& c) { return c->all_committed_lsn(); }
 tracker_stats dlsn_stats(client_handle const& c, std::size_t sample_limit) { return c->dlsn_stats(sample_limit); }
 std::size_t replica_count(client_handle const& c) { return c->replica_count(); }

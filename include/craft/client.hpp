@@ -21,6 +21,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <system_error>
 #include <vector>
@@ -145,5 +146,22 @@ int64_t all_committed_lsn(client_handle const& c);
 tracker_stats dlsn_stats(client_handle const& c, std::size_t sample_limit = 16);
 std::size_t replica_count(client_handle const& c);
 uint32_t leader_index(client_handle const& c);
+
+// ── per-member latency ──
+// One leg: a single member's write, read or keep_alive, timed from issue to reply (or error). A write acks at
+// quorum, but its slower legs keep running and are still reported, which is what shows a slow member. A split read
+// to one member is one leg.
+enum class leg_op : uint8_t { write, read, keep_alive };
+struct leg_sample {
+    std::size_t member; // the member slot (member_ids order); a replaced member keeps its slot
+    leg_op op;
+    uint64_t usec;
+    bool ok; // false: the member answered with an error, timed out, or could not be reached
+};
+using leg_observer = std::function< void(leg_sample const&) >;
+// Called on the thread that completes the leg (a queue's reap thread, or a transport completion thread), so it must
+// be thread-safe, cheap and must not block. Set it once, before the first IO (like login: setup ordering, not a
+// lock); with none set, legs are not timed at all.
+void set_leg_observer(client_handle const& c, leg_observer obs);
 
 } // namespace craft
