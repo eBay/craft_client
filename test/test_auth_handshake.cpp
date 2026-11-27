@@ -624,6 +624,36 @@ TEST(CraftAuthHandshake, OnRingSendFailureMidFrameDropsTheConnection) {
     EXPECT_EQ(replica.accepted(), 2);
 }
 
+// A send that fails before any byte of its frame reached the socket (say, no SQE was free) leaves the stream intact:
+// the op fails as never delivered, but the connection stays up and carries the next op without a reconnect.
+TEST(CraftAuthHandshake, OnRingSendFailureBeforeAnyByteKeepsTheConnection) {
+    auto rs = replica_script{};
+    rs.enforce = false;
+    rs.connections = 2;
+    scripted_replica replica{rs};
+    {
+        ring_session ring{replica.port(), std::nullopt};
+        ASSERT_TRUE(ring.ready().has_value());
+
+        ring.conn->set_send_fault_for_test([](std::size_t, std::size_t) -> long { return -EAGAIN; });
+        auto a = std::make_shared< ka_result >();
+        issue_conn_keep_alive(ring.conn.get(), a).detach();
+        ASSERT_TRUE(ring.driver.drive_until([&] { return a->has_value(); }));
+        ASSERT_FALSE(a->value().has_value());
+        EXPECT_EQ(a->value().error(), net::net_error::send);
+        EXPECT_TRUE(ring.conn->ready()) << "nothing of the frame went out: no reason to drop the socket";
+
+        ring.conn->set_send_fault_for_test(nullptr);
+        auto b = std::make_shared< ka_result >();
+        issue_conn_keep_alive(ring.conn.get(), b).detach();
+        ASSERT_TRUE(ring.driver.drive_until([&] { return b->has_value(); }));
+        EXPECT_TRUE(b->value().has_value()) << "the same connection carries the next op";
+        ring.driver.drain_for(std::chrono::milliseconds{50});
+    }
+    replica.join();
+    EXPECT_EQ(replica.accepted(), 1) << "no reconnect";
+}
+
 // A send failure that belongs to an older connection (a reconnect opened a newer one meanwhile) must not close the
 // newer socket: the connection stays usable and no reconnect happens.
 TEST(CraftAuthHandshake, OnRingStaleSendFailureLeavesTheNewConnection) {

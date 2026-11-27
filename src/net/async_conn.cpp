@@ -76,6 +76,7 @@ void craft_async_conn::release_send(uint64_t epoch) noexcept {
     auto const w = send_waiters_.front();
     send_waiters_.erase(send_waiters_.begin()); // FIFO; sending_ STAYS true -- the slot is handed to w
     *w.granted = true;
+    *w.epoch = send_epoch_; // the slot changes hands within this epoch
     if (w.h) w.h.resume();
 }
 
@@ -143,8 +144,9 @@ sisl::async::light_task< int > craft_async_conn::ring_connect() {
 }
 
 sisl::async::light_task< int > craft_async_conn::ring_send_all(std::span< uint8_t const > data, uint64_t gen,
-                                                               uint64_t epoch) {
-    std::size_t off = 0;
+                                                               uint64_t epoch, std::size_t* sent) {
+    std::size_t& off = *sent;
+    off = 0;
     while (off < data.size()) {
         sisl::async::cqe_awaitable ev;
         std::size_t len = data.size() - off;
@@ -241,25 +243,29 @@ craft_async_conn::round_trip(wire::op o, std::span< uint8_t const > op_hdr, std:
 
     // Hold the wire's send slot for the WHOLE of this message so its bytes are contiguous on the socket, then
     // release before waiting for the reply (the next op sends while we wait; replies demux by request_id).
-    if (!co_await send_awaitable{this}) {
+    send_awaitable grant{this};
+    if (!co_await grant) {
         // Woken by fail_all() without the slot: the connection went down while we queued. Nothing was sent, so this
         // is a send failure -- provably never delivered -- not `closed` (delivery uncertain).
         pending_.erase(rid);
         co_return std::unexpected(net_error::send);
     }
-    uint64_t const epoch = send_epoch_; // our ownership of the send slot
+    uint64_t const epoch = grant.epoch; // our ownership of the send slot, captured when it was granted
     uint64_t const gen = conn_gen_;     // the connection this frame goes out on
-    int const sr = co_await ring_send_all(out, gen, epoch);
+    std::size_t sent = 0;
+    int const sr = co_await ring_send_all(out, gen, epoch, &sent);
     if (sr < 0) {
-        // The frame may be PARTIALLY on the socket (ring_send_all stops after a short send that errors, or when no
-        // SQE is free). Keeping the connection would let the next message's bytes follow the fragment, so the server
-        // could parse a frame whose payload mixes the two, and the caller would report it as "never delivered"
-        // (REPLICA_DOWN). Drop the socket BEFORE handing the send slot on: the pump sees the close and fails every
-        // other pending op, a send already queued behind us fails on the dead fd, and the next op reconnects.
-        // Only if this is still the connection we sent on: a stale send's late failure must never close a newer
-        // socket that a reconnect opened meanwhile.
+        // If part of the frame is on the socket (a short send that then errored, or no SQE free for the rest),
+        // keeping the connection would let the next message's bytes follow the fragment: the server could parse a
+        // frame whose payload mixes the two, while the caller reports it as "never delivered" (REPLICA_DOWN). So drop
+        // the socket BEFORE handing the send slot on: the pump sees the close and fails every other pending op, a
+        // send already queued behind us fails on the dead fd, and the next op reconnects. Only if this is still the
+        // connection we sent on: a stale send's late failure must never close a newer socket a reconnect opened.
+        // When NOTHING of the frame went out (say no SQE was free for its first send) the stream is intact: keep the
+        // connection rather than churn it over local backpressure. A socket that is actually broken is found by the
+        // pump's recv.
         pending_.erase(rid);
-        if (gen == conn_gen_) drop_fd();
+        if (sent > 0 && gen == conn_gen_) drop_fd();
         release_send(epoch);
         co_return std::unexpected(net_error::send);
     }

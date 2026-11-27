@@ -147,19 +147,22 @@ private:
     struct send_waiter {
         std::coroutine_handle<> h;
         bool* granted;
+        uint64_t* epoch; // set together with *granted: the epoch the slot was handed over in
     };
     struct send_awaitable {
         craft_async_conn* c;
         bool granted{false};
+        uint64_t epoch{0}; // the send epoch this op owns the slot in, captured at the grant itself
         bool await_ready() noexcept {
             if (!c->sending_) {
                 c->sending_ = true;
                 granted = true;
+                epoch = c->send_epoch_;
                 return true;
             }
             return false;
         }
-        void await_suspend(std::coroutine_handle<> h) noexcept { c->send_waiters_.push_back({h, &granted}); }
+        void await_suspend(std::coroutine_handle<> h) noexcept { c->send_waiters_.push_back({h, &granted, &epoch}); }
         bool await_resume() const noexcept { return granted; }
     };
     void release_send(uint64_t epoch) noexcept; // hand the slot to the next parked op, or free it (if still ours)
@@ -179,7 +182,10 @@ private:
     // Send all of `data`, looping over partial sends via IORING_OP_SEND on the ring. 0 ok, <0 on error.
     // Sends all of `data` on the socket of generation `gen`, while holding the send slot of epoch `epoch`. Stops with
     // -ECONNRESET, sending nothing more, as soon as either has moved on (see round_trip).
-    sisl::async::light_task< int > ring_send_all(std::span< uint8_t const > data, uint64_t gen, uint64_t epoch);
+    // `*sent` counts the bytes of `data` that reached the socket, so the caller knows whether a failure left a
+    // fragment.
+    sisl::async::light_task< int > ring_send_all(std::span< uint8_t const > data, uint64_t gen, uint64_t epoch,
+                                                 std::size_t* sent);
     // The persistent recv pump: one IORING_OP_RECV at a time; parse every complete message out of rx_ and demux
     // it by request_id to the waiting reply_slot. Re-arms until shutdown / a recv fault fails all pending. A
     // stand-alone disk_task (like ublkpp's queue_service): we steal its _coro, resume once, and destroy at

@@ -13,8 +13,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (HomeBlocks `docs/craft/resync.md` §4.4-§4.5: mid-session verdicts raced in-flight acks). The resolution driver,
   its want watermark, the per-member resolution gates and the replace-member resolution hand-off are removed;
   `request_resolution` and the wire `resolve` op stay for compatibility.
-- The TCP transport drops the connection on any send failure, so a partially sent frame is never followed by the
-  next message's bytes.
+- The TCP transport drops the connection on a send failure that left part of a frame on the socket, so a partially
+  sent frame is never followed by the next message's bytes. A failure before any byte went out (for example, no
+  free SQE) keeps the connection.
 - The in-memory reference cluster's login resolves every unresolved slot up to its starting point.
 
 ## 0.6.0
