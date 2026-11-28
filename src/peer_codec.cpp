@@ -232,25 +232,33 @@ async_result< fetch_all_result > fetch_all(craft_peer& peer, peer_ctx ctx, std::
                                            uint64_t max_bytes, std::function< void(fetch_result&) > on_chunk) {
     fetch_all_result out;
     bool first = true;
-    while (!ranges.empty()) {
-        auto r = co_await peer.fetch_data(ctx, ranges, max_bytes);
-        if (!r) co_return std::unexpected(r.error());
-        ++out.replies;
-        if (first) {
-            out.session_term = r->session_term;
-            first = false;
-        } else if (r->session_term != out.session_term) {
-            // The responder took a login between two replies: what it serves now may belong to another session.
-            co_return std::unexpected(make_error_condition(craft_error::STALE_TERM));
+    std::size_t done = 0; // ranges[0, done) are fully covered
+    while (done < ranges.size()) {
+        // One request carries at most k_fetch_max_ranges ranges: a gap with more separate holes goes in batches.
+        std::size_t const end = std::min(ranges.size(), done + std::size_t{wire::k_fetch_max_ranges});
+        std::vector< lsn_range > batch(ranges.begin() + static_cast< std::ptrdiff_t >(done),
+                                       ranges.begin() + static_cast< std::ptrdiff_t >(end));
+        while (!batch.empty()) {
+            auto r = co_await peer.fetch_data(ctx, batch, max_bytes);
+            if (!r) co_return std::unexpected(r.error());
+            ++out.replies;
+            // Judge the reply BEFORE the consumer sees it: a consumer may install slots and cannot take them back.
+            if (first) {
+                out.session_term = r->session_term;
+                first = false;
+            } else if (r->session_term != out.session_term) {
+                // The responder took a login between two replies: what it serves now may belong to another session.
+                co_return std::unexpected(make_error_condition(craft_error::STALE_TERM));
+            }
+            // A reply must cover something: `next` past the first requested dLSN.
+            if (r->next >= 0 && r->next <= batch.front().lo)
+                co_return std::unexpected(std::make_error_condition(std::errc::protocol_error));
+            out.reclaimed_below = std::max(out.reclaimed_below, r->reclaimed_below);
+            out.slots += r->slots.size();
+            if (on_chunk) on_chunk(*r);
+            batch = r->next < 0 ? std::vector< lsn_range >{} : ranges_from(batch, r->next);
         }
-        out.reclaimed_below = std::max(out.reclaimed_below, r->reclaimed_below);
-        out.slots += r->slots.size();
-        if (on_chunk) on_chunk(*r);
-        if (r->next < 0) break;
-        // A reply must cover something: `next` past the first requested dLSN.
-        if (r->next <= ranges.front().lo)
-            co_return std::unexpected(std::make_error_condition(std::errc::protocol_error));
-        ranges = ranges_from(ranges, r->next);
+        done = end;
     }
     co_return out;
 }

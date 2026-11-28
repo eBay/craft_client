@@ -182,6 +182,31 @@ int craft_conn::io_send(std::span< uint8_t const > d) {
     return res;
 }
 
+int craft_conn::io_send(std::span< uint8_t const > d, std::chrono::steady_clock::time_point deadline) {
+    io_uring_sqe* sqe = io_uring_get_sqe(&ring_);
+    io_uring_prep_send(sqe, fd_, d.data(), d.size(), MSG_NOSIGNAL);
+    if (io_uring_submit(&ring_) < 0) return -1;
+    io_uring_cqe* cqe = nullptr;
+    auto const now = std::chrono::steady_clock::now();
+    auto const rem = deadline > now ? deadline - now : std::chrono::steady_clock::duration::zero();
+    auto const secs = std::chrono::duration_cast< std::chrono::seconds >(rem);
+    __kernel_timespec ts{};
+    ts.tv_sec = secs.count();
+    ts.tv_nsec = std::chrono::duration_cast< std::chrono::nanoseconds >(rem - secs).count();
+    int const w = io_uring_wait_cqe_timeout(&ring_, &cqe, &ts);
+    if (w == -ETIME) {
+        // The peer is not draining. Shut the socket down so the send completes (with an error), and reap that
+        // completion: only then is `d` no longer referenced by the kernel.
+        ::shutdown(fd_, SHUT_RDWR);
+        if (io_uring_wait_cqe(&ring_, &cqe) == 0) io_uring_cqe_seen(&ring_, cqe);
+        return -2;
+    }
+    if (w < 0) return -1;
+    int const res = cqe->res;
+    io_uring_cqe_seen(&ring_, cqe);
+    return res;
+}
+
 int craft_conn::io_recv(std::span< uint8_t > d, std::optional< std::chrono::steady_clock::time_point > deadline) {
     io_uring_sqe* sqe = io_uring_get_sqe(&ring_);
     io_uring_prep_recv(sqe, fd_, d.data(), d.size(), 0);
@@ -204,6 +229,17 @@ int craft_conn::io_recv(std::span< uint8_t > d, std::optional< std::chrono::stea
     int const res = cqe->res;
     io_uring_cqe_seen(&ring_, cqe);
     return res;
+}
+
+bool craft_conn::send_all(std::span< uint8_t const > data, std::chrono::milliseconds timeout) {
+    auto const deadline = std::chrono::steady_clock::now() + timeout;
+    std::size_t sent = 0;
+    while (sent < data.size()) {
+        int const n = io_send(data.subspan(sent), deadline);
+        if (n <= 0) return false; // -2: timed out (socket shut down); 0 / <0: closed or failed
+        sent += static_cast< std::size_t >(n);
+    }
+    return true;
 }
 
 bool craft_conn::send_all(std::span< uint8_t const > data) {

@@ -74,6 +74,10 @@ public:
 
     // Send all of `data`, looping over partial sends. False on error.
     bool send_all(std::span< uint8_t const > data);
+    // Bounded: false if every byte is not on the socket within `timeout` (a peer that stopped reading fills its
+    // buffers). On expiry the socket is shut down so the in-flight send completes, and that completion is reaped
+    // before returning, so `data` is no longer referenced. The connection is unusable afterwards.
+    bool send_all(std::span< uint8_t const > data, std::chrono::milliseconds timeout);
 
     // Receive exactly one framed CRAFT message: recv into an internal buffer until parse_message succeeds,
     // returning that message's bytes (any bytes read past it are kept for the next call). `dg` says which
@@ -93,6 +97,8 @@ private:
 
     void close_all() noexcept;
     int io_send(std::span< uint8_t const >); // CQE res: bytes, or <0 on error
+    // As io_send, but -2 if the deadline passes first (after shutting the socket and reaping the send's completion).
+    int io_send(std::span< uint8_t const >, std::chrono::steady_clock::time_point deadline);
     // CQE res: bytes; 0 = EOF; -1 error; -2 timed out (recv SQE left pending -> caller must reset the conn).
     int io_recv(std::span< uint8_t >, std::optional< std::chrono::steady_clock::time_point > deadline = std::nullopt);
 };

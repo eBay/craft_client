@@ -372,6 +372,17 @@ result< std::vector< JournalSlot > > RaftReplica::fetch_from(craft_peer& peer, b
             }
         }));
     if (!r) return std::unexpected(r.error());
+    // Provenance: the responder may have missed a login that dropped some of its slots, and the dLSN may have been
+    // reused since. Such a slot is not held as far as this member is concerned.
+    {
+        std::lock_guard< std::mutex > g{mu_};
+        auto const before = slots.size();
+        std::erase_if(slots,
+                      [&](JournalSlot const& s) { return peer::dropped_by_a_later_login(logins_, s.lsn, s.term); });
+        if (slots.size() != before)
+            LOGWARN("fetch_from[partition={}]: ignored {} slot(s) a later login dropped (responder session_term={})",
+                    boost::uuids::to_string(partition_uuid), before - slots.size(), r->session_term);
+    }
     return slots;
 }
 
@@ -385,7 +396,7 @@ MemCraftReplica::MemJournalSlot RaftReplica::to_mem_journal_slot(JournalSlot con
         bytes = take_payload(j.data);
     }
     return MemCraftReplica::MemJournalSlot{
-        .term = term,
+        .term = j.term != 0 ? j.term : term, // keep the session the slot was written in (0: a peer that sent none)
         .lba = j.lba,
         .len = j.len,
         .all_zeros = j.all_zeros,
@@ -707,6 +718,7 @@ void RaftReplica::internal_login(InternalLoginMsg m) {
         std::lock_guard< std::mutex > g{mu_};
         state_.client_token = m.client_token;
         state_.term = m.term;
+        logins_[m.term] = m.rs_commit_lsn;
         on_state_changed();
         if (pending_login_timer_) {
             watchdog_->cancel(*pending_login_timer_);

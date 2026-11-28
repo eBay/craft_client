@@ -106,6 +106,11 @@ private:
     class RaftCommitWorker;
     std::unique_ptr< RaftCommitWorker > commit_worker_;
     std::optional< Watchdog::TimerId > pending_login_timer_;
+    // Every committed login, term -> its watermark (rs_commit_lsn), guarded by mu_. A fetched slot written at session
+    // term s was dropped by the first login after s if that login's watermark is below it: such a copy (from a member
+    // that missed the login) must never fill a dLSN the next session reused. In memory only: after a restart the
+    // history is empty and fetched slots are accepted as before.
+    std::map< uint64_t, int64_t > logins_; // see peer::dropped_by_a_later_login
     std::weak_ptr< registry_manager > registry_mgr_;
     std::shared_ptr< raft_service > raft_service_;
 };

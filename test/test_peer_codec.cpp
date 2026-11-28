@@ -19,6 +19,7 @@
 #include <cstdint>
 #include <cstring>
 #include <deque>
+#include <map>
 #include <vector>
 
 #include <gtest/gtest.h>
@@ -281,10 +282,53 @@ TEST(PeerFetchAll, StopsWhenTheResponderTakesALogin) {
 
 TEST(PeerFetchAll, AReplyThatMakesNoProgressIsAnError) {
     scripted_peer p;
-    p.replies.push_back(reply({}, 0)); // next == the first requested dLSN
-    auto const r = rg(peer::fetch_all(p, ctx(), {{0, 9}}, 0, nullptr));
+    p.replies.push_back(reply({0}, 0)); // next == the first requested dLSN
+    std::size_t chunks = 0;
+    auto const r = rg(peer::fetch_all(p, ctx(), {{0, 9}}, 0, [&](fetch_result&) { ++chunks; }));
     ASSERT_FALSE(r.has_value());
     EXPECT_EQ(r.error(), std::make_error_condition(std::errc::protocol_error));
+    EXPECT_EQ(chunks, 0u) << "an invalid reply is refused before the consumer sees (and installs) its slots";
+}
+
+// More separate holes than one request may carry: the ranges go in batches of k_fetch_max_ranges, and every one is
+// covered.
+TEST(PeerFetchAll, ManyHolesGoInBatches) {
+    struct counting_peer : craft_peer {
+        std::vector< std::size_t > sizes;
+        async_result< poll_reply > get_rs_commit_lsn(peer_ctx const&, bool) override { co_return poll_reply{}; }
+        async_result< fetch_result > fetch_data(peer_ctx const&, std::vector< lsn_range > ranges, uint64_t) override {
+            sizes.push_back(ranges.size());
+            fetch_result r;
+            r.session_term = 3;
+            for (auto const& g : ranges) {
+                JournalSlot s;
+                s.lsn = g.lo;
+                s.all_zeros = true;
+                r.slots.push_back(s);
+            }
+            co_return r;
+        }
+    } p;
+    std::vector< lsn_range > holes;
+    for (int64_t i = 0; i < 5000; ++i)
+        holes.push_back({2 * i, 2 * i});
+    std::size_t got = 0;
+    auto const r = rg(peer::fetch_all(p, ctx(), holes, 0, [&](fetch_result& c) { got += c.slots.size(); }));
+    ASSERT_TRUE(r.has_value());
+    EXPECT_EQ(p.sizes, (std::vector< std::size_t >{wire::k_fetch_max_ranges, 5000 - wire::k_fetch_max_ranges}));
+    EXPECT_EQ(got, 5000u);
+}
+
+// The provenance rule (HomeBlocks #224): a slot written at term s is dropped if the first login after s has a
+// watermark below it.
+TEST(PeerProvenance, ASlotALaterLoginDroppedIsNotHeld) {
+    std::map< uint64_t, int64_t > const logins{{2, 10}, {5, 40}};
+    EXPECT_FALSE(peer::dropped_by_a_later_login(logins, 10, 1)) << "at the next login's watermark: kept";
+    EXPECT_TRUE(peer::dropped_by_a_later_login(logins, 11, 1)) << "above it: dropped";
+    EXPECT_FALSE(peer::dropped_by_a_later_login(logins, 30, 2)) << "the next login after term 2 is term 5 (W=40)";
+    EXPECT_TRUE(peer::dropped_by_a_later_login(logins, 41, 3));
+    EXPECT_FALSE(peer::dropped_by_a_later_login(logins, 1000, 5)) << "the current session: no later login";
+    EXPECT_FALSE(peer::dropped_by_a_later_login(logins, 1000, 0)) << "no term: cannot judge";
 }
 
 TEST(PeerFetchAll, ATransportErrorStopsTheLoop) {

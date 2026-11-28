@@ -472,3 +472,21 @@ TEST(CraftTcpPeer, ThreadsSharingOnePeerGetTheirOwnReplies) {
     }
     EXPECT_EQ(bad.load(), 0);
 }
+
+// A send to a peer that stopped reading is bounded: once its buffers fill, send_all gives up at the deadline (after
+// shutting the socket and reaping the in-flight send) instead of blocking the caller -- and CraftTcpPeer's mutex.
+TEST(CraftConn, SendIsBoundedWhenThePeerStopsReading) {
+    auto lst = craft_listener::bind_listen(0);
+    ASSERT_TRUE(lst.has_value());
+    std::optional< craft_conn > held; // accepted, never read
+    std::jthread acc([&] {
+        if (auto c = lst->accept()) held.emplace(std::move(*c));
+    });
+    auto conn = craft_conn::connect("127.0.0.1", lst->port());
+    ASSERT_TRUE(conn.has_value());
+    std::vector< uint8_t > big(64u << 20, 0xAB); // far more than both sockets' buffers
+    auto const t0 = std::chrono::steady_clock::now();
+    EXPECT_FALSE(conn->send_all(big, std::chrono::milliseconds{300}));
+    EXPECT_LT(std::chrono::steady_clock::now() - t0, std::chrono::seconds{10});
+    acc.join();
+}

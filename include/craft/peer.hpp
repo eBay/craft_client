@@ -33,6 +33,7 @@
 #include <cstdint>
 #include <expected>
 #include <functional>
+#include <map>
 #include <memory>
 #include <span>
 #include <string_view>
@@ -183,6 +184,17 @@ std::expected< fetch_result, decode_error > decode_fetch_data_rsp(sisl::io_blob 
 
 // The ranges still to fetch after a reply that stopped at `next` (every dLSN below `next` was covered).
 std::vector< lsn_range > ranges_from(std::vector< lsn_range > const& ranges, int64_t next);
+
+// ── provenance ──
+// `logins`: every committed login, session term -> its watermark (rs_commit_lsn). A slot written at session term
+// `slot_term` was dropped by the first login after that term if the login's watermark is below `lsn`: a member that
+// missed the login still holds it, and the dLSN may have been reused since, so a requester must not take it as held.
+// A slot with no term (0) cannot be judged and is not dropped. (HomeBlocks #224 applies the same rule.)
+inline bool dropped_by_a_later_login(std::map< uint64_t, int64_t > const& logins, int64_t lsn, uint64_t slot_term) {
+    if (slot_term == 0) return false;
+    auto const it = logins.upper_bound(slot_term);
+    return it != logins.end() && it->second < lsn;
+}
 
 // ── caller side: fetch every range, one bounded reply at a time ──
 struct fetch_all_result {

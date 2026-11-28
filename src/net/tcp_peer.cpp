@@ -1,6 +1,8 @@
 #include "net/tcp_peer.hpp"
 
+#include <algorithm>
 #include <cstring>
+#include <optional>
 
 #include <craft/status.hpp> // status_to_error
 
@@ -54,9 +56,9 @@ result< std::vector< uint8_t > > CraftTcpPeer::round_trip(wire::op op, std::size
     if (next_rid_ == 0) next_rid_ = 1;
     std::vector< uint8_t > out;
     wire::frame_message(out, op, 0, rid, payload.first(op_hdr_size), payload.subspan(op_hdr_size));
-    if (!conn_.send_all(out)) {
+    if (!conn_.send_all(out, op_timeout_)) { // bounded: a peer that stops reading must not hold mu_ forever
         connected_ = false;
-        return fail(make_error_condition(craft_error::REPLICA_DOWN)); // never delivered
+        return fail(make_error_condition(craft_error::REPLICA_DOWN));
     }
     auto msg = conn_.recv_message(reply_bound, op_timeout_);
     if (!msg) {
@@ -86,6 +88,14 @@ async_result< fetch_result > CraftTcpPeer::fetch_data(peer_ctx const& ctx, std::
                                                       uint64_t max_bytes) {
     // Never ask for more than this connection can parse.
     uint64_t const want = (max_bytes == 0 || max_bytes > max_tx_) ? max_tx_ : max_bytes;
+    // The request body must fit the responder's max_tx too: send as many ranges as fit, and continue at the first
+    // range not sent when the reply covers everything sent.
+    std::size_t const fit = std::max< std::size_t >(1, max_tx_ / (2 * sizeof(int64_t)));
+    std::optional< int64_t > unsent_lo;
+    if (ranges.size() > fit) {
+        unsent_lo = ranges[fit].lo;
+        ranges.resize(fit);
+    }
     auto const req = peer::encode_fetch_data_req(ctx, ranges, want);
     auto msg =
         round_trip(wire::op::fetch_data, sizeof(wire::fetch_data_req), req, wire::fetch_reply_parse_bound(max_tx_));
@@ -105,6 +115,7 @@ async_result< fetch_result > CraftTcpPeer::fetch_data(peer_ctx const& ctx, std::
         }
         s.data.iovs = {iovec{s.owned_data->data(), s.owned_data->size()}};
     }
+    if (unsent_lo && r->next < 0) r->next = *unsent_lo;
     co_return std::move(*r);
 }
 
