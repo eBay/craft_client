@@ -74,10 +74,10 @@ TEST(CraftWire, OpHeaderSizes) {
     EXPECT_EQ(op_hdr_size(static_cast< uint8_t >(op::resolve_rsp)), 16u);
     EXPECT_EQ(op_hdr_size(static_cast< uint8_t >(op::create_volume)), 32u);
     EXPECT_EQ(op_hdr_size(static_cast< uint8_t >(op::create_volume_rsp)), 0u);
-    EXPECT_EQ(op_hdr_size(static_cast< uint8_t >(op::get_rs_commit_lsn)), 16u);
-    EXPECT_EQ(op_hdr_size(static_cast< uint8_t >(op::get_rs_commit_lsn_rsp)), 16u);
-    EXPECT_EQ(op_hdr_size(static_cast< uint8_t >(op::fetch_data)), 8u);
-    EXPECT_EQ(op_hdr_size(static_cast< uint8_t >(op::fetch_data_rsp)), 8u);
+    EXPECT_EQ(op_hdr_size(static_cast< uint8_t >(op::get_rs_commit_lsn)), 48u); // peer v2: peer_req_hdr + is_login
+    EXPECT_EQ(op_hdr_size(static_cast< uint8_t >(op::get_rs_commit_lsn_rsp)), 48u);
+    EXPECT_EQ(op_hdr_size(static_cast< uint8_t >(op::fetch_data)), 56u);
+    EXPECT_EQ(op_hdr_size(static_cast< uint8_t >(op::fetch_data_rsp)), 32u);
     EXPECT_EQ(op_hdr_size(static_cast< uint8_t >(op::auth_start)), 56u);
     EXPECT_EQ(op_hdr_size(static_cast< uint8_t >(op::auth_challenge)), 32u);
     EXPECT_EQ(op_hdr_size(static_cast< uint8_t >(op::auth_proof)), 32u);

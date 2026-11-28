@@ -31,6 +31,14 @@
 #include <craft/net/conn.hpp>
 #include "net/wire_client.hpp"
 #include "net/tcp_server.hpp"
+#include "net/tcp_peer.hpp"
+#include "registry_mgr.hpp"
+#include "helper.hpp" // registry_key
+
+#include <atomic>
+#include <optional>
+#include <craft/peer.hpp>
+#include <boost/uuid/random_generator.hpp>
 
 using namespace craft::net;
 namespace wire = craft::wire;
@@ -293,4 +301,192 @@ TEST(CraftTcp, ConnectDeadlineBoundsABlackholedPeer) {
     auto const elapsed = std::chrono::steady_clock::now() - t0;
     EXPECT_FALSE(c.has_value());
     EXPECT_LT(elapsed, std::chrono::seconds{5}) << "connect must fail at the deadline, not the SYN-retry window";
+}
+
+// ── peer plane (wire v2) over a real loopback socket: CraftTcpPeer against the reference server ──
+namespace {
+
+// A reference server serving `connections` connections (each on its own thread), with one partition registered so
+// its peer handlers accept requests for it.
+struct peer_server {
+    std::optional< craft_listener > lst;
+    std::shared_ptr< craft::registry_manager > reg = std::make_shared< craft::registry_manager >();
+    boost::uuids::uuid partition = boost::uuids::random_generator()();
+    std::unique_ptr< craft_tcp_server > server;
+    std::jthread acceptor;
+    uint16_t port{0};
+
+    explicit peer_server(int connections, uint32_t max_tx = 512 * 1024) {
+        auto l = craft_listener::bind_listen(0);
+        EXPECT_TRUE(l.has_value());
+        lst.emplace(std::move(*l));
+        port = lst->port();
+        auto geo = make_geo();
+        geo.max_tx = max_tx;
+        server = std::make_unique< craft_tcp_server >(std::move(geo), std::string{}, reg);
+        reg->put< std::vector< boost::uuids::uuid > >(
+            craft::registry_key("partition_info", partition),
+            std::make_shared< std::vector< boost::uuids::uuid > >(std::vector< boost::uuids::uuid >{partition}));
+        acceptor = std::jthread([this, connections] {
+            std::vector< std::jthread > serving;
+            for (int i = 0; i < connections; ++i) {
+                auto conn = lst->accept();
+                if (!conn) return;
+                serving.emplace_back([this, c = std::move(*conn)]() mutable { server->serve(std::move(c)); });
+            }
+        });
+    }
+    craft::peer_ctx ctx(uint64_t session_term) const { return craft::peer_ctx{partition, 0, session_term}; }
+};
+
+} // namespace
+
+// The poll returns the v2 reply: positions, the responder's session term and its (absent) journal floor.
+TEST(CraftTcpPeer, PollReturnsTheV2Reply) {
+    peer_server srv{2};
+    uint64_t term = 0;
+    {
+        auto cli = wire_client::connect("127.0.0.1", srv.port);
+        ASSERT_TRUE(cli.has_value());
+        auto lr = cli->login({}, 0x77);
+        ASSERT_TRUE(lr.has_value());
+        term = lr->term;
+        auto const p = pattern(k_lba);
+        ASSERT_TRUE(cli->write(0, 0, k_lba, {p.data(), p.size()}, -1).has_value());
+        craft::net::CraftTcpPeer peer{"127.0.0.1", srv.port, {}};
+        auto const r = sisl::async::sync_get(peer.get_rs_commit_lsn(srv.ctx(term), false));
+        ASSERT_TRUE(r.has_value()) << r.error().message();
+        EXPECT_EQ(r->lsns.last_append_lsn, 0);
+        EXPECT_EQ(r->session_term, term);
+        EXPECT_EQ(r->fence_term, term) << "not fenced";
+        EXPECT_EQ(r->journal_floor, -1);
+        EXPECT_FALSE(r->snapshot_receiving);
+    }
+}
+
+// A gap larger than one reply arrives in several bounded replies through fetch_all, every slot with its data and
+// term; a zero write comes back as all_zeros.
+TEST(CraftTcpPeer, AGapLargerThanMaxTxArrivesInPieces) {
+    constexpr uint32_t k_max_tx = 64 * 1024; // 16 pages per reply
+    constexpr int N = 40;
+    peer_server srv{2, k_max_tx};
+    auto cli = wire_client::connect("127.0.0.1", srv.port);
+    ASSERT_TRUE(cli.has_value());
+    auto lr = cli->login({}, 0x78);
+    ASSERT_TRUE(lr.has_value());
+    for (int d = 0; d < N; ++d) {
+        auto const p = pattern(k_lba, static_cast< uint8_t >(d));
+        auto w = d == 17 ? cli->write(d, uint64_t(d) * k_lba, k_lba, std::span< uint8_t const >{}, d - 1)
+                         : cli->write(d, uint64_t(d) * k_lba, k_lba, {p.data(), p.size()}, d - 1);
+        ASSERT_TRUE(w.has_value());
+        ASSERT_EQ(w->status, wire::status::ok);
+    }
+    {
+        craft::net::CraftTcpPeer peer{"127.0.0.1", srv.port, {}, std::chrono::milliseconds{0}, k_max_tx};
+        std::vector< craft::JournalSlot > got;
+        auto const r = sisl::async::sync_get(
+            craft::peer::fetch_all(peer, srv.ctx(lr->term), {{0, N - 1}}, 0, [&](craft::fetch_result& c) {
+                for (auto& s : c.slots)
+                    got.push_back(std::move(s));
+            }));
+        ASSERT_TRUE(r.has_value()) << r.error().message();
+        EXPECT_GE(r->replies, 3u) << "160 KiB of slot data cannot fit one 64 KiB reply";
+        EXPECT_EQ(r->session_term, lr->term);
+        ASSERT_EQ(got.size(), std::size_t{N});
+        for (int d = 0; d < N; ++d) {
+            auto const& s = got[d];
+            EXPECT_EQ(s.lsn, d);
+            EXPECT_EQ(s.term, lr->term) << "the slot's own session term rides the descriptor";
+            if (d == 17) {
+                EXPECT_TRUE(s.all_zeros);
+                continue;
+            }
+            ASSERT_TRUE(s.owned_data) << "each slot owns its bytes once the reply buffer is gone";
+            EXPECT_EQ(*s.owned_data, pattern(k_lba, static_cast< uint8_t >(d))) << "dLSN " << d;
+        }
+    }
+}
+
+// A request for a partition the server does not serve is refused, and so is any other peer_version.
+TEST(CraftTcpPeer, AnotherPartitionOrVersionIsRefused) {
+    peer_server srv{2};
+    {
+        craft::net::CraftTcpPeer peer{"127.0.0.1", srv.port, {}};
+        craft::peer_ctx other{boost::uuids::random_generator()(), 0, 1};
+        auto const p = sisl::async::sync_get(peer.get_rs_commit_lsn(other, false));
+        ASSERT_FALSE(p.has_value());
+        EXPECT_EQ(p.error(), std::make_error_condition(std::errc::invalid_argument));
+        auto const f = sisl::async::sync_get(peer.fetch_data(other, {{0, 9}}, 0));
+        ASSERT_FALSE(f.has_value());
+        EXPECT_EQ(f.error(), std::make_error_condition(std::errc::invalid_argument));
+    }
+    {
+        auto conn = craft_conn::connect("127.0.0.1", srv.port);
+        ASSERT_TRUE(conn.has_value());
+        auto payload = craft::peer::encode_fetch_data_req(srv.ctx(1), {{0, 9}}, 0);
+        payload[0] = 1; // peer_version 1
+        std::vector< uint8_t > out;
+        wire::frame_message(out, wire::op::fetch_data, 0, 9,
+                            std::span< uint8_t const >{payload}.first(sizeof(wire::fetch_data_req)),
+                            std::span< uint8_t const >{payload}.subspan(sizeof(wire::fetch_data_req)));
+        ASSERT_TRUE(conn->send_all(out));
+        auto msg = conn->recv_message(wire::fetch_reply_parse_bound(512 * 1024), std::chrono::seconds{5});
+        ASSERT_TRUE(msg.has_value());
+        auto const parsed = wire::parse_message(*msg, wire::fetch_reply_parse_bound(512 * 1024));
+        ASSERT_TRUE(parsed.has_value());
+        EXPECT_EQ(static_cast< wire::status >(parsed->hdr.status), wire::status::invalid_argument);
+    }
+}
+
+// One CraftTcpPeer shared by several threads: each round trip holds the connection, so every caller gets its own
+// reply (before, two callers could read each other's).
+TEST(CraftTcpPeer, ThreadsSharingOnePeerGetTheirOwnReplies) {
+    peer_server srv{2};
+    auto cli = wire_client::connect("127.0.0.1", srv.port);
+    ASSERT_TRUE(cli.has_value());
+    auto lr = cli->login({}, 0x79);
+    ASSERT_TRUE(lr.has_value());
+    for (int d = 0; d < 8; ++d) {
+        auto const p = pattern(k_lba, static_cast< uint8_t >(d));
+        ASSERT_TRUE(cli->write(d, uint64_t(d) * k_lba, k_lba, {p.data(), p.size()}, d - 1).has_value());
+    }
+    craft::net::CraftTcpPeer peer{"127.0.0.1", srv.port, {}};
+    std::atomic< int > bad{0};
+    {
+        std::vector< std::jthread > ts;
+        for (int t = 0; t < 4; ++t)
+            ts.emplace_back([&, t] {
+                for (int i = 0; i < 50; ++i) {
+                    int64_t const d = (t + i) % 8;
+                    if (t % 2 == 0) {
+                        auto r = sisl::async::sync_get(peer.fetch_data(srv.ctx(lr->term), {{d, d}}, 0));
+                        if (!r || r->slots.size() != 1 || r->slots[0].lsn != d ||
+                            *r->slots[0].owned_data != pattern(k_lba, static_cast< uint8_t >(d)))
+                            ++bad;
+                    } else {
+                        auto r = sisl::async::sync_get(peer.get_rs_commit_lsn(srv.ctx(lr->term), false));
+                        if (!r || r->lsns.last_append_lsn != 7) ++bad;
+                    }
+                }
+            });
+    }
+    EXPECT_EQ(bad.load(), 0);
+}
+
+// A send to a peer that stopped reading is bounded: once its buffers fill, send_all gives up at the deadline (after
+// shutting the socket and reaping the in-flight send) instead of blocking the caller -- and CraftTcpPeer's mutex.
+TEST(CraftConn, SendIsBoundedWhenThePeerStopsReading) {
+    auto lst = craft_listener::bind_listen(0);
+    ASSERT_TRUE(lst.has_value());
+    std::optional< craft_conn > held; // accepted, never read
+    std::jthread acc([&] {
+        if (auto c = lst->accept()) held.emplace(std::move(*c));
+    });
+    auto conn = craft_conn::connect("127.0.0.1", lst->port());
+    ASSERT_TRUE(conn.has_value());
+    std::vector< uint8_t > big(64u << 20, 0xAB); // far more than both sockets' buffers
+    auto const t0 = std::chrono::steady_clock::now();
+    EXPECT_FALSE(conn->send_all(big, std::chrono::milliseconds{300}));
+    EXPECT_LT(std::chrono::steady_clock::now() - t0, std::chrono::seconds{10});
+    acc.join();
 }

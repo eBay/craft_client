@@ -155,10 +155,10 @@ void RaftReplica::replica_init(std::string const& replica_config_path) {
             .host = m.at("host").get< std::string >(),
             .raft_port = m.at("raft_port").get< uint16_t >(),
             .tcp_port = m.at("tcp_port").get< uint16_t >(),
-            .peer_client = (id == ep_.id)
-                ? nullptr
-                : std::make_shared< net::CraftTcpPeer >(m.at("host").get< std::string >(),
-                                                        m.at("tcp_port").get< uint16_t >(), id),
+            .peer_client = (id == ep_.id) ? nullptr
+                                          : std::make_shared< net::CraftTcpPeer >(
+                                                m.at("host").get< std::string >(), m.at("tcp_port").get< uint16_t >(),
+                                                id, std::chrono::milliseconds{0}, max_tx_),
         });
         reg->put< raft_peer_t >(raft_service::peer_id_key(id),
                                 std::make_shared< raft_peer_t >(std::make_pair(r->host, r->raft_port)));
@@ -294,10 +294,13 @@ RaftReplica::RaftReplica(raft_replica_params params) :
 
 RaftReplica::~RaftReplica() = default;
 
-result< lsn_pair > RaftReplica::do_get_rs_commit_lsn(uint64_t term, bool is_login) {
+poll_reply RaftReplica::do_get_rs_commit_lsn(uint64_t term, bool is_login) {
     std::unique_lock< std::mutex > lk{mu_};
-    auto const ret = lsn_pair{state_.commit_lsn, state_.last_append_lsn};
+    // The model fences by switching its session term to the login's (no separate fence_term): report the session term
+    // the poll found, and the term it is fenced at now.
+    auto ret = poll_reply{lsn_pair{state_.commit_lsn, state_.last_append_lsn}, state_.term, state_.term, -1, false};
     if (!is_login) { return ret; }
+    ret.fence_term = term;
     auto const current_term = state_.term;
     state_.term = term; // quesce ios from older client
     if (pending_login_timer_) { watchdog_->cancel(*pending_login_timer_); }
@@ -314,8 +317,73 @@ result< lsn_pair > RaftReplica::do_get_rs_commit_lsn(uint64_t term, bool is_logi
     return ret;
 }
 
-result< std::vector< JournalSlot > > RaftReplica::srv_fetch_data(std::vector< int64_t > const& lsns) {
-    return do_fetch(lsns);
+bool RaftReplica::srv_has_partition(volume_id_t const& partition_id) const {
+    auto p = lock_registry(registry_mgr_)
+                 ->get< partition_peers_list_t >(registry_key(partition_info_key_prefix, partition_id));
+    return p && !p->empty();
+}
+
+result< poll_reply > RaftReplica::srv_get_rs_commit_lsn(peer_ctx const& ctx, bool is_login) {
+    if (!srv_has_partition(ctx.partition_id))
+        return std::unexpected(std::make_error_condition(std::errc::invalid_argument));
+    return do_get_rs_commit_lsn(ctx.session_term, is_login);
+}
+
+result< fetch_result > RaftReplica::srv_fetch_data(peer_ctx const& ctx, std::vector< lsn_range > const& ranges,
+                                                   uint64_t data_budget) {
+    if (!srv_has_partition(ctx.partition_id))
+        return std::unexpected(std::make_error_condition(std::errc::invalid_argument));
+    return do_fetch(ranges, data_budget);
+}
+
+namespace {
+// Ascending dLSNs -> the fewest inclusive ranges covering exactly them.
+std::vector< lsn_range > to_ranges(std::vector< int64_t > const& lsns) {
+    std::vector< lsn_range > out;
+    for (auto lsn : lsns) {
+        if (!out.empty() && out.back().hi + 1 == lsn)
+            out.back().hi = lsn;
+        else
+            out.push_back({lsn, lsn});
+    }
+    return out;
+}
+} // namespace
+
+result< std::vector< JournalSlot > > RaftReplica::fetch_from(craft_peer& peer, boost::uuids::uuid const& partition_uuid,
+                                                             uint64_t term, std::vector< int64_t > const& lsns) {
+    std::vector< JournalSlot > slots;
+    if (lsns.empty()) return slots;
+    // No RAFT term in the model: leader_raft_term stays 0, which the reference server accepts.
+    peer_ctx const ctx{partition_uuid, 0, term};
+    auto r = sisl::async::sync_get(
+        peer::fetch_all(peer, ctx, to_ranges(lsns), 0 /* the responder's bound */, [&](fetch_result& chunk) {
+            for (auto& s : chunk.slots) {
+                // A slot may borrow from the reply buffer: keep its bytes before the next reply replaces it.
+                if (!s.owned_data && s.data.size > 0) {
+                    s.owned_data = std::make_shared< std::vector< uint8_t > >();
+                    for (auto const& iov : s.data.iovs) {
+                        auto const* p = static_cast< uint8_t const* >(iov.iov_base);
+                        s.owned_data->insert(s.owned_data->end(), p, p + iov.iov_len);
+                    }
+                    s.data.iovs = {iovec{s.owned_data->data(), s.owned_data->size()}};
+                }
+                slots.push_back(std::move(s));
+            }
+        }));
+    if (!r) return std::unexpected(r.error());
+    // Provenance: the responder may have missed a login that dropped some of its slots, and the dLSN may have been
+    // reused since. Such a slot is not held as far as this member is concerned.
+    {
+        std::lock_guard< std::mutex > g{mu_};
+        auto const before = slots.size();
+        std::erase_if(slots,
+                      [&](JournalSlot const& s) { return peer::dropped_by_a_later_login(logins_, s.lsn, s.term); });
+        if (slots.size() != before)
+            LOGWARN("fetch_from[partition={}]: ignored {} slot(s) a later login dropped (responder session_term={})",
+                    boost::uuids::to_string(partition_uuid), before - slots.size(), r->session_term);
+    }
+    return slots;
 }
 
 // ── peer comm hooks (driven by raft) ──
@@ -328,7 +396,7 @@ MemCraftReplica::MemJournalSlot RaftReplica::to_mem_journal_slot(JournalSlot con
         bytes = take_payload(j.data);
     }
     return MemCraftReplica::MemJournalSlot{
-        .term = term,
+        .term = j.term != 0 ? j.term : term, // keep the session the slot was written in (0: a peer that sent none)
         .lba = j.lba,
         .len = j.len,
         .all_zeros = j.all_zeros,
@@ -373,7 +441,7 @@ std::pair< std::vector< int64_t >, int64_t > RaftReplica::resolve_and_apply(boos
     std::vector< std::vector< JournalSlot > > all_responses;
     for (auto const& peer : peers) {
         if (peer.id == ep_.id) { continue; }
-        if (auto r = sisl::async::sync_get(peer.peer_client->fetch_data(missing_lsns)); r) {
+        if (auto r = fetch_from(*peer.peer_client, partition_uuid, term, missing_lsns); r) {
             all_responses.emplace_back(std::move(r.value()));
         } else {
             LOGWARN("resolve_and_apply[partition={}]: fetch_data to peer {} failed/unreachable, error: {}",
@@ -488,13 +556,14 @@ result< LoginResult > RaftReplica::apply_login(std::array< uint8_t, 16 > const& 
              boost::uuids::to_string(partition_uuid), members.size());
     for (auto const& m : members) {
         if (m.id == ep_.id) { continue; }
-        if (auto r = sisl::async::sync_get(
-                m.peer_client->get_rs_commit_lsn(term /* send proposed term */, true /* is_login */));
-            r) {
-            LOGDEBUG("apply_login[partition={}]: peer {} reported commit_lsn={} last_append_lsn={}",
-                     boost::uuids::to_string(partition_uuid), boost::uuids::to_string(m.id), r->commit_lsn,
-                     r->last_append_lsn);
-            peer_resp.emplace_back(r.value());
+        // The login poll carries the proposed term: the peer fences at it. No RAFT term in the model (0).
+        if (auto p = sisl::async::sync_get(
+                m.peer_client->get_rs_commit_lsn(peer_ctx{partition_uuid, 0, term}, true /* is_login */));
+            p) {
+            LOGDEBUG("apply_login[partition={}]: peer {} reported commit_lsn={} last_append_lsn={} session_term={}",
+                     boost::uuids::to_string(partition_uuid), boost::uuids::to_string(m.id), p->lsns.commit_lsn,
+                     p->lsns.last_append_lsn, p->session_term);
+            peer_resp.emplace_back(p->lsns);
         } else {
             LOGWARN("apply_login[partition={}]: peer {} did not respond to GetRSCommitLSN",
                     boost::uuids::to_string(partition_uuid), boost::uuids::to_string(m.id));
@@ -611,7 +680,7 @@ void RaftReplica::apply_sync(boost::uuids::uuid const& partition_uuid, SyncRSCom
         if (missing.empty()) break;
         if (peer.id == ep_.id) continue; // don't ask self
 
-        auto r = sisl::async::sync_get(peer.peer_client->fetch_data(missing));
+        auto r = fetch_from(*peer.peer_client, partition_uuid, term, missing);
         if (!r) continue; // unreachable, try next peer
 
         std::erase_if(missing, [&](int64_t lsn) {
@@ -649,6 +718,7 @@ void RaftReplica::internal_login(InternalLoginMsg m) {
         std::lock_guard< std::mutex > g{mu_};
         state_.client_token = m.client_token;
         state_.term = m.term;
+        logins_[m.term] = m.rs_commit_lsn;
         on_state_changed();
         if (pending_login_timer_) {
             watchdog_->cancel(*pending_login_timer_);

@@ -71,11 +71,10 @@ enum class op : uint8_t {
 
     // 1..14 is the CLIENT plane, and it is complete: these are exactly the verbs of craft_replica.
     //
-    // 15.. is RESERVED for the PEER plane (a replica asking another replica: get_lsns / get_rs_commit_lsn /
-    // fetch_data / truncate -- see craft_peer.hpp). Nothing is allocated yet: the peer plane is deferred at the
-    // WIRE, not merely at the transport. Two rules bind whoever allocates them:
+    // 15-16 create a volume (bootstrap). 17-20 are the PEER plane (wire v2: a replica asking another replica; see
+    // the peer_req_hdr layouts below and include/craft/peer.hpp). 21-24 are AUTH. Two rules bind whoever adds an op:
     //   1. keep the request=odd / response=even convention, and
-    //   2. bump k_max_op below -- is_response() is a range check, so a peer op added without it is silently
+    //   2. bump k_max_op below -- is_response() is a range check, so an op added without it is silently
     //      misclassified as "not a response". That is the trap this constant exists to close.
 
     create_volume = 15, // client-requested volume creation: bootstrap-only
@@ -106,6 +105,7 @@ enum class status : uint8_t {
     not_exposed = 8,      // AUTH: no credential for the volume on this replica
     stale_credential = 9, // AUTH: the username is not the replica's current credential
     auth_failed = 10,     // AUTH: the client's proof did not verify
+    reclaimed = 11,       // PEER: every requested slot is below the responder's journal floor (reclaimed)
     internal = 255,
 };
 
@@ -240,38 +240,74 @@ struct volume_create_req {
 };
 // volume_create_rsp: status only (no operation header, no body).
 
-// GetRSCommitLSN: non-RAFT peer query of a replica's {commit_lsn, last_append_lsn}. is_login triggers the
-// quiesce barrier on the responder (see CRAFT Design's Login section).
+// ── PEER plane (replica to replica), wire v2 ── See docs/wire.md "Peer plane". Ops 17-20 were redefined in place
+// for v2 (the v1 layouts were never deployed); every request leads with peer_req_hdr and a responder answers
+// invalid_argument to any other peer_version.
+constexpr uint16_t k_peer_version = 2;
+
+// Leads every peer request: who is asking, about which partition, under which terms.
+struct peer_req_hdr {
+    uint16_t peer_version; // k_peer_version
+    uint8_t reserved[6];
+    std::array< uint8_t, 16 > partition_id;
+    uint64_t leader_raft_term; // the requester's RAFT term: a responder refuses a stale one (stale_term)
+    uint64_t session_term;     // the requester's CRAFT session term; a login poll carries the login's new term
+};
+
+// GetRSCommitLSN: a replica's positions. is_login fences the responder for the login (session_term is the new
+// term), so the old session's writes are refused from then on.
 struct get_rs_commit_lsn_req {
-    uint64_t term;
-    uint8_t is_login; // bool, but keep POD-packed layout consistent with the rest of this file
+    peer_req_hdr peer;
+    uint8_t is_login;
     uint8_t reserved[7];
 };
 struct get_rs_commit_lsn_rsp {
     int64_t commit_lsn;
     int64_t last_append_lsn;
+    uint64_t session_term;      // the responder's session term
+    uint64_t fence_term;        // the term a login fenced it at (== session_term when not fenced)
+    int64_t journal_floor;      // its journal holds nothing at or below this (-1: nothing reclaimed)
+    uint8_t snapshot_receiving; // 1: installing a snapshot (serves no data meanwhile)
+    uint8_t reserved[7];
 };
 
-// used during login and recovery
+// FetchData: the held slots in `range_count` inclusive [lo, hi] dLSN ranges (body: range_count x {i64 lo, i64 hi},
+// ascending, non-overlapping), as many as fit in `max_bytes` of slot data (0: the responder's max_tx). Bounded by
+// k_fetch_max_slots descriptors per reply as well. The requester continues from the reply's `next`.
 struct fetch_data_req {
-    uint32_t lsn_count;
+    peer_req_hdr peer;
+    uint32_t range_count;
     uint32_t reserved;
-}; // body: lsn_count x int64_t
+    uint64_t max_bytes;
+};
+constexpr uint32_t k_fetch_max_ranges = 4096;
+constexpr uint32_t k_fetch_max_slots = 1024;
 
 struct fetch_slot_desc {
-    int64_t lsn;         // which dLSN this is
-    uint64_t lba;        // where it writes to
-    uint32_t len;        // how many blocks
-    uint64_t byte_len;   // data bytes size
-    uint8_t is_empty;    // Empty verdict? (no data follows)
-    uint8_t all_zeros;   // zero write? (no data follows)
-    uint8_t reserved[2]; // padding
+    int64_t lsn;   // which dLSN this is
+    uint64_t term; // the session term it was written at (a requester rejects one a later login dropped)
+    uint64_t lba;  // where it writes to
+    uint32_t len;  // how many blocks
+    uint32_t reserved0;
+    uint64_t byte_len; // data bytes that follow for this slot (0 for empty / all_zeros)
+    uint8_t is_empty;  // Empty verdict? (no data follows)
+    uint8_t all_zeros; // zero write? (no data follows)
+    uint8_t reserved[6];
 };
 struct fetch_data_rsp {
-    uint32_t slot_count; // how many fetch_slot_desc entries are in the body
+    uint64_t session_term;   // the responder's session term
+    int64_t next;            // first dLSN of the request NOT covered by this reply (-1: everything was covered)
+    int64_t reclaimed_below; // the responder reclaimed every slot <= this (-1: none); those are not "absent"
+    uint32_t slot_count;     // how many fetch_slot_desc entries open the body
     uint32_t reserved;
 };
-// body: slot_count x fetch_slot_desc, THEN the raw data bytes for slots that have real data
+// body: slot_count x fetch_slot_desc in ascending dLSN order, THEN each data-bearing slot's bytes in the same order.
+
+// A fetch reply's body is at most max_tx of slot data plus k_fetch_max_slots descriptors, so the requester parses
+// it with this bound, not max_tx.
+constexpr uint32_t fetch_reply_parse_bound(uint32_t max_tx) noexcept {
+    return max_tx + k_fetch_max_slots * static_cast< uint32_t >(sizeof(fetch_slot_desc));
+}
 
 // AUTH layouts are independent of the wire version; a new scheme is a new auth_start_req::version.
 constexpr uint16_t k_auth_version = 1;
@@ -312,11 +348,12 @@ static_assert(sizeof(logout_req) == 16);
 static_assert(sizeof(resolve_req) == 24);
 static_assert(sizeof(resolve_rsp) == 16);
 static_assert(sizeof(volume_create_req) == 32);
-static_assert(sizeof(get_rs_commit_lsn_req) == 16);
-static_assert(sizeof(get_rs_commit_lsn_rsp) == 16);
-static_assert(sizeof(fetch_data_req) == 8);
-static_assert(sizeof(fetch_slot_desc) == 32);
-static_assert(sizeof(fetch_data_rsp) == 8);
+static_assert(sizeof(peer_req_hdr) == 40);
+static_assert(sizeof(get_rs_commit_lsn_req) == 48);
+static_assert(sizeof(get_rs_commit_lsn_rsp) == 48);
+static_assert(sizeof(fetch_data_req) == 56);
+static_assert(sizeof(fetch_slot_desc) == 48);
+static_assert(sizeof(fetch_data_rsp) == 32);
 static_assert(sizeof(auth_start_req) == 56);
 static_assert(sizeof(auth_challenge_rsp) == 32);
 static_assert(sizeof(auth_proof_req) == 32);

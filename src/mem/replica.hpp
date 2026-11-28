@@ -169,8 +169,12 @@ public:
     // NOTE these are not yet reached THROUGH craft_peer: MemTransport's cold path (run_login / run_resolution) is
     // a friend and drives the cold_* / peek_* helpers below directly. Routing it through this interface is step
     // one of making the peer plane real; step two is allocating its opcodes (wire::op stops at 14).
-    async_result< lsn_pair > get_rs_commit_lsn(uint64_t term, bool is_login) override;
-    async_result< std::vector< JournalSlot > > fetch_data(std::vector< int64_t > lsns) override;
+    // The in-process model has one partition per replica and no RAFT term, so it accepts any partition id and any
+    // leader_raft_term (the TCP server checks the partition). It does not quiesce on is_login (MemTransport's login
+    // fences directly).
+    async_result< poll_reply > get_rs_commit_lsn(peer_ctx const& ctx, bool is_login) override;
+    async_result< fetch_result > fetch_data(peer_ctx const& ctx, std::vector< lsn_range > ranges,
+                                            uint64_t max_bytes) override;
 
     peer_id_t id() const override { return ep_.id; } // craft_replica
 
@@ -239,7 +243,12 @@ private:
     status do_truncate(int64_t lsn);
     result< resolution_result > do_resolve_local(client_hdr hdr, int64_t upto); // N=1 resolution (srv seam)
 protected:
-    result< std::vector< JournalSlot > > do_fetch(std::vector< int64_t > const& lsns);
+    // The positions a peer poll reports (the model has no separate fence and never reclaims from below).
+    poll_reply do_poll();
+    // The held slots in `ranges`, ascending, until `data_budget` bytes of slot data or wire::k_fetch_max_slots
+    // descriptors (always at least one slot); `next` is the first dLSN not covered. Each data slot shares the journal's
+    // buffer through owned_data, so it outlives mu_ while a reply is serialized.
+    fetch_result do_fetch(std::vector< lsn_range > const& ranges, uint64_t data_budget);
 
 private:
     // ── on-ring transport (a verb's non-null `q`) ──

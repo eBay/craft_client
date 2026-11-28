@@ -14,6 +14,8 @@
  *********************************************************************************/
 
 #include "mem/replica.hpp"
+
+#include <craft/wire.hpp>  // k_fetch_max_slots, k_default_max_tx
 #include "mem/cluster.hpp" // the full MemTransport type
 
 #include <algorithm>
@@ -216,9 +218,10 @@ async_result< resolution_result > MemCraftReplica::request_resolution(::io_uring
     co_return net_->run_resolution(this, hdr.term, upto);
 }
 
-async_result< lsn_pair > MemCraftReplica::get_rs_commit_lsn(uint64_t, bool) { co_return do_lsns(); }
-async_result< std::vector< JournalSlot > > MemCraftReplica::fetch_data(std::vector< int64_t > lsns) {
-    co_return do_fetch(lsns);
+async_result< poll_reply > MemCraftReplica::get_rs_commit_lsn(peer_ctx const&, bool) { co_return do_poll(); }
+async_result< fetch_result > MemCraftReplica::fetch_data(peer_ctx const&, std::vector< lsn_range > ranges,
+                                                         uint64_t max_bytes) {
+    co_return do_fetch(ranges, max_bytes != 0 ? max_bytes : wire::k_default_max_tx);
 }
 
 // ── synchronous cores ──
@@ -297,25 +300,41 @@ status MemCraftReplica::do_truncate(int64_t lsn) {
     return ok();
 }
 
-result< std::vector< JournalSlot > > MemCraftReplica::do_fetch(std::vector< int64_t > const& lsns) {
+poll_reply MemCraftReplica::do_poll() {
     std::lock_guard< std::mutex > g{mu_};
-    std::vector< JournalSlot > out;
-    for (auto lsn : lsns) {
-        auto it = journal_->find(lsn);
-        if (it == journal_->end()) continue; // not-present-here => omit
-        auto const& s = it->second;
-        JournalSlot js;
-        js.lsn = lsn;
-        js.is_empty = s.is_empty;
-        js.all_zeros = s.all_zeros;
-        js.lba = s.lba;
-        js.len = s.len;
-        if (!s.all_zeros && !s.is_empty && s.bytes) {
-            // seam: the sg_list points into the slot's owned buffer (valid while the slot lives).
-            js.data.size = s.bytes->size();
-            js.data.iovs.push_back(iovec{s.bytes->data(), s.bytes->size()});
+    return poll_reply{lsn_pair{state_.commit_lsn, state_.last_append_lsn}, state_.term, state_.term, -1, false};
+}
+
+fetch_result MemCraftReplica::do_fetch(std::vector< lsn_range > const& ranges, uint64_t data_budget) {
+    std::lock_guard< std::mutex > g{mu_};
+    fetch_result out;
+    out.session_term = state_.term;
+    uint64_t data = 0;
+    for (auto const& r : ranges) {
+        for (auto it = journal_->lower_bound(r.lo); it != journal_->end() && it->first <= r.hi; ++it) {
+            auto const& s = it->second;
+            bool const has_data = !s.all_zeros && !s.is_empty && s.bytes;
+            uint64_t const bytes = has_data ? s.bytes->size() : 0;
+            // Stop before a slot that would overflow the reply -- but always serve at least one.
+            if (!out.slots.empty() && (out.slots.size() >= wire::k_fetch_max_slots || data + bytes > data_budget)) {
+                out.next = it->first;
+                return out;
+            }
+            JournalSlot js;
+            js.lsn = it->first;
+            js.term = s.term;
+            js.is_empty = s.is_empty;
+            js.all_zeros = s.all_zeros;
+            js.lba = s.lba;
+            js.len = s.len;
+            if (has_data) {
+                js.owned_data = s.bytes; // a reference, not a copy: a truncate or verdict cannot free it under us
+                js.data.size = s.bytes->size();
+                js.data.iovs.push_back(iovec{s.bytes->data(), s.bytes->size()});
+            }
+            data += bytes;
+            out.slots.push_back(std::move(js));
         }
-        out.push_back(std::move(js));
     }
     return out;
 }

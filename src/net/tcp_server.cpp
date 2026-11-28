@@ -27,6 +27,7 @@
 
 #include "raft/raft_replica.hpp" // the full RaftReplica (+ sisl::sg_list via sisl/fds/buffer.hpp)
 #include "registry_mgr.hpp"
+#include <craft/peer.hpp>   // the peer v2 codec
 #include <craft/status.hpp> // to_wire_status (the shared wire <-> craft_error bridge)
 #include "helper.hpp"
 
@@ -380,75 +381,70 @@ void craft_tcp_server::on_create_volume(craft_conn& conn, wire::message const& r
     conn.send_all(out);
 }
 
-void craft_tcp_server::on_get_rs_commit_lsn(craft_conn& conn, wire::message const& req) {
-    auto const gr = wire::decode< wire::get_rs_commit_lsn_req >(req.op_header);
-    wire::get_rs_commit_lsn_rsp rsp{-1, -1};
-    wire::status code = wire::status::ok;
+namespace {
+// A peer request's payload: the op header then the body, as the codec expects (copied: requests are small).
+std::vector< uint8_t > peer_payload(wire::message const& req) {
+    std::vector< uint8_t > p(req.op_header.begin(), req.op_header.end());
+    p.insert(p.end(), req.body.begin(), req.body.end());
+    return p;
+}
+} // namespace
 
-    auto const r = replica_->srv_get_rs_commit_lsn(gr.term, gr.is_login != 0);
-    if (!r) {
+void craft_tcp_server::on_get_rs_commit_lsn(craft_conn& conn, wire::message const& req) {
+    wire::status code = wire::status::ok;
+    std::vector< uint8_t > payload;
+    auto const pr = peer::decode_get_rs_commit_lsn_req(peer_payload(req));
+    if (!pr) {
+        LOGWARN("craft_srv GET_RS_COMMIT_LSN [rid:{}]: bad request (decode error {})", req.hdr.request_id,
+                static_cast< int >(pr.error()));
+        code = wire::status::invalid_argument;
+    } else if (auto const r = replica_->srv_get_rs_commit_lsn(pr->ctx, pr->is_login); !r) {
         LOGWARN("craft_srv GET_RS_COMMIT_LSN [rid:{}]: failed: {}", req.hdr.request_id, r.error().message());
         code = to_wire_status(r.error());
     } else {
-        rsp.commit_lsn = r->commit_lsn;
-        rsp.last_append_lsn = r->last_append_lsn;
+        payload = peer::encode_get_rs_commit_lsn_rsp(*r);
+        LOGINFO("craft_srv GET_RS_COMMIT_LSN [rid:{}] session_term={} is_login={} commit_lsn={} last_append_lsn={}",
+                req.hdr.request_id, pr->ctx.session_term, pr->is_login, r->lsns.commit_lsn, r->lsns.last_append_lsn);
     }
-
-    LOGINFO("craft_srv GET_RS_COMMIT_LSN [rid:{}] term={} is_login={} status={} commit_lsn={} last_append_lsn={}",
-            req.hdr.request_id, gr.term, gr.is_login, static_cast< int >(code), rsp.commit_lsn, rsp.last_append_lsn);
+    if (payload.empty()) payload = peer::encode_get_rs_commit_lsn_rsp(poll_reply{lsn_pair{-1, -1}});
 
     std::vector< uint8_t > out;
-    wire::frame_message(out, wire::op::get_rs_commit_lsn_rsp, static_cast< uint8_t >(code), req.hdr.request_id,
-                        as_bytes(rsp), {});
+    wire::frame_message(out, wire::op::get_rs_commit_lsn_rsp, static_cast< uint8_t >(code), req.hdr.request_id, payload,
+                        {});
     conn.send_all(out);
 }
 
 void craft_tcp_server::on_fetch_data(craft_conn& conn, wire::message const& req) {
-    // TODO: Apply max_tx cap and chunking for very large fetch requests.
-    auto const fr = wire::decode< wire::fetch_data_req >(req.op_header);
-    auto const lsns = wire::decode_lsns(req.body, fr.lsn_count);
-
-    wire::fetch_data_rsp rsp{};
-    std::vector< uint8_t > body;
     wire::status code = wire::status::ok;
-
-    if (!lsns) {
-        LOGERROR("craft_srv FETCH_DATA [rid:{}]: malformed body (lsn list truncated)", req.hdr.request_id);
-        code = wire::status::invalid_argument; // body shorter than lsn_count implies -- malformed request
+    fetch_result result; // holds each slot's bytes (owned_data) until the reply is sent
+    auto const fr = peer::decode_fetch_data_req(peer_payload(req));
+    if (!fr) {
+        LOGWARN("craft_srv FETCH_DATA [rid:{}]: bad request (decode error {})", req.hdr.request_id,
+                static_cast< int >(fr.error()));
+        code = wire::status::invalid_argument;
     } else {
-        auto const r = replica_->srv_fetch_data(*lsns);
-        if (!r) {
+        // The reply carries at most max_tx of slot data (and at most k_fetch_max_slots descriptors): the requester
+        // continues from `next`.
+        uint64_t const budget = (fr->max_bytes == 0 || fr->max_bytes > geo_.max_tx) ? geo_.max_tx : fr->max_bytes;
+        if (auto r = replica_->srv_fetch_data(fr->ctx, fr->ranges, budget); !r) {
             LOGWARN("craft_srv FETCH_DATA [rid:{}]: failed: {}", req.hdr.request_id, r.error().message());
             code = to_wire_status(r.error());
         } else {
-            rsp.slot_count = static_cast< uint32_t >(r->size());
-            for (auto const& slot : *r) {
-                wire::fetch_slot_desc sd{};
-                sd.lsn = slot.lsn;
-                sd.lba = slot.lba;
-                sd.len = slot.len;
-                sd.is_empty = slot.is_empty ? 1 : 0;
-                sd.all_zeros = slot.all_zeros ? 1 : 0;
-                sd.byte_len = 0;
-                if (!slot.is_empty && !slot.all_zeros) { sd.byte_len += slot.data.size; }
-                wire::put(body, sd);
-            }
-            for (auto const& slot : *r) {
-                if (slot.is_empty || slot.all_zeros) continue;
-                for (auto const& iov : slot.data.iovs) {
-                    auto const* p = static_cast< uint8_t const* >(iov.iov_base);
-                    body.insert(body.end(), p, p + iov.iov_len);
-                }
-            }
+            result = std::move(*r);
         }
     }
 
-    LOGDEBUG("craft_srv FETCH_DATA [rid:{}] requested={} status={} returned={}", req.hdr.request_id, fr.lsn_count,
-             static_cast< int >(code), rsp.slot_count);
+    // Op header first, then the body: the descriptors, then each data slot's bytes.
+    auto const enc = peer::encode_fetch_data_rsp(result);
+    std::vector< uint8_t > body(enc.header.begin() + sizeof(wire::fetch_data_rsp), enc.header.end());
+    for (auto const& b : enc.data_blobs)
+        body.insert(body.end(), b.cbytes(), b.cbytes() + b.size());
+    LOGDEBUG("craft_srv FETCH_DATA [rid:{}] ranges={} status={} returned={} next={}", req.hdr.request_id,
+             fr ? fr->ranges.size() : 0, static_cast< int >(code), result.slots.size(), result.next);
 
     std::vector< uint8_t > out;
     wire::frame_message(out, wire::op::fetch_data_rsp, static_cast< uint8_t >(code), req.hdr.request_id,
-                        {reinterpret_cast< uint8_t const* >(&rsp), sizeof(rsp)}, body);
+                        std::span< uint8_t const >{enc.header}.first(sizeof(wire::fetch_data_rsp)), body);
     conn.send_all(out);
 }
 
